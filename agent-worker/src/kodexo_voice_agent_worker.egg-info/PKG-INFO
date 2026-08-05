@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: kodexo-voice-agent-worker
+Version: 0.1.0
+Summary: LiveKit agent worker: STT (Deepgram) -> LLM (Groq) -> TTS (Deepgram Aura) inbound sales-qualification voice agent
+Requires-Python: >=3.11
+Requires-Dist: livekit-agents>=1.0
+Requires-Dist: livekit-plugins-deepgram
+Requires-Dist: livekit-plugins-silero
+Requires-Dist: livekit-plugins-groq
+Requires-Dist: livekit-plugins-noise-cancellation
+Requires-Dist: supabase>=2.9
+Requires-Dist: httpx>=0.27
+Requires-Dist: python-dotenv>=1.0

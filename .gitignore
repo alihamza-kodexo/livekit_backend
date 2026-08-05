@@ -1,0 +1,27 @@
+# dashboard/ is its own separate git repo (pushed to livekit_frontend) --
+# excluded here so this repo (livekit_backend) doesn't duplicate it.
+/dashboard/
+
+# Secrets -- never commit real credentials. .env.example files are templates
+# and stay tracked.
+.env
+.env.local
+!.env.example
+
+# Dependencies
+node_modules/
+
+# Python
+agent-worker/.venv/
+__pycache__/
+*.pyc
+
+# Claude Code local session state
+.claude/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

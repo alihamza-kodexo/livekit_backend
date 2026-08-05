@@ -1,0 +1,86 @@
+"""Direct Slack notifications -- the Phase 6 replacement for what the FSD
+originally routed through n8n (Sections 5.3.1/5.3.2). Since this build skips
+n8n entirely, the worker posts to the Slack incoming-webhook URL itself right
+after each call ends.
+
+NOTE: the exact message copy/format here is a reasonable best-effort, not a
+transcription of FSD Section 5.3.1/5.3.2 -- I don't have that section's exact
+wording. Treat these two message builders as the thing to check against the
+real FSD text before launch, not as already-verified copy.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import httpx
+
+from .models import Agent, CallOutcome
+from .settings import slack_settings
+
+logger = logging.getLogger("worker.notify")
+
+
+async def _post_to_slack(payload: dict) -> None:
+    settings = slack_settings()
+    if not settings.webhook_url:
+        logger.info("SLACK_WEBHOOK_URL not set; skipping Slack notification")
+        return
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(settings.webhook_url, json=payload)
+            response.raise_for_status()
+    except Exception:
+        logger.exception("failed to post Slack notification")
+
+
+async def send_call_summary(
+    *,
+    agent: Agent,
+    caller_number: str | None,
+    outcome: CallOutcome | None,
+    duration_seconds: int,
+    matched_department: str | None,
+    lead_name: str | None,
+    lead_company: str | None,
+    lead_need: str | None,
+) -> None:
+    """FSD 5.3.1 equivalent: the standard per-call summary."""
+
+    minutes, seconds = divmod(duration_seconds, 60)
+    lines = [
+        f"*Call finished* -- {agent.name}",
+        f"*From:* {caller_number or 'unknown'}",
+        f"*Outcome:* {(outcome or 'unknown').replace('_', ' ')}",
+        f"*Duration:* {minutes}m {seconds}s",
+    ]
+    if matched_department:
+        lines.append(f"*Transferred to:* {matched_department}")
+    if lead_name or lead_company:
+        lines.append(f"*Lead:* {lead_name or '—'} ({lead_company or 'no company given'})")
+    if lead_need:
+        lines.append(f"*Need:* {lead_need}")
+
+    await _post_to_slack({"text": "\n".join(lines)})
+
+
+async def send_transfer_failure_alert(
+    *,
+    agent: Agent,
+    caller_number: str | None,
+    department_name: str,
+    callback_number: str | None,
+) -> None:
+    """FSD 5.3.2 equivalent: the urgent @channel alert when a transfer fails
+    and the caller was told a callback is coming -- someone has to actually
+    make that callback."""
+
+    lines = [
+        "@channel :rotating_light: *Transfer failed -- callback owed*",
+        f"*Agent:* {agent.name}",
+        f"*Caller:* {caller_number or 'unknown'}",
+        f"*Wanted:* {department_name}",
+        f"*Callback number given:* {callback_number or 'caller did not provide one'}",
+    ]
+    await _post_to_slack({"text": "\n".join(lines)})

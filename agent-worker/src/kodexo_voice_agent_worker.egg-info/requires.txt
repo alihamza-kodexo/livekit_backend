@@ -1,0 +1,8 @@
+livekit-agents>=1.0
+livekit-plugins-deepgram
+livekit-plugins-silero
+livekit-plugins-groq
+livekit-plugins-noise-cancellation
+supabase>=2.9
+httpx>=0.27
+python-dotenv>=1.0
