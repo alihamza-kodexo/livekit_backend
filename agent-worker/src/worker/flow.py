@@ -1,18 +1,28 @@
-"""The inbound call flow -- FSD Section 3.3 (call classification + qualifying
-sequence + special cases) and 3.5 (knowledge-base off-topic Q&A), built as one
-Agent whose instructions are assembled from the agent's Supabase row.
+"""The inbound call flow -- one Agent whose instructions come from the
+agent's own configured prompt, not a hardcoded script.
 
-NOTE: I don't have the FSD's exact Section 3.3 wording (the classification
-categories, the qualifying-question order, the sales-pitch decline line, the
-scam-termination trigger) -- the instructions below are built from the
-Project Plan v2 Phase 5 task list, which names these same pieces but not their
-exact scripted copy. Treat INSTRUCTIONS_TEMPLATE as the thing to check against
-the real FSD text before launch, not as already-verified copy.
+Deliberately minimal: the model's behavior is driven by (1) the agent's own
+system prompt, exactly as typed into the dashboard, and (2) each tool's own
+description, which the model already sees via the function-calling schema on
+every turn regardless of what's in the prompt text. This file used to wrap
+that prompt in a large hand-authored call-handling script (classification
+steps, a qualifying-question order, scam/sales-pitch heuristics, an AI-
+disclosure paragraph, etc.) -- that script wasn't configured by any admin, so
+it silently overrode whatever they actually wrote and crowded out the tool
+descriptions' own influence on tool-calling. Removed for that reason: an
+admin who wants any of that back writes it into the prompt themselves.
+
+The only things added below are data that has its own dashboard field with no
+other way to reach the model (qualification questions, end-call conditions)
+and two voice-call mechanics tied to actual settings rather than scripted
+behavior: reply length (Voice & humanness tuning) and a one-line reminder
+that end_call is the one tool every agent always has and must actually call
+to hang up -- a spoken goodbye by itself doesn't end the call.
 
 Deterministic actions (transfer, ending the call, recording data) are pushed
 into tool calls rather than left to the LLM to narrate, so the parts that
 matter for compliance and correctness happen in code -- the LLM only decides
-*when* to call them.
+*when* to call them, guided by each tool's own description.
 """
 
 from __future__ import annotations
@@ -25,86 +35,28 @@ from . import tools
 from .models import AgentConfig
 from .pronunciation import stt_keyterms, substitute_stream
 
-DEFAULT_END_CALL_GUIDANCE = (
-    "End the call once qualification is complete and there's nothing further to transfer or "
-    "discuss."
-)
-
-INSTRUCTIONS_TEMPLATE = """\
-{custom_prompt}
-
-## How this call must be handled
-
-You are a phone receptionist. Callers cannot see you -- everything you convey \
-must be said out loud. Keep replies to about {max_reply_sentences} sentence(s) at a time; \
-a phone caller cannot absorb a long paragraph.
-
-1. **Classify the call first**, from what the caller says after your greeting:
-   - **Real inquiry** -- they want something legitimate related to this business. Move to \
-qualification below.
-   - **Wants a human / doesn't want an AI** -- ask exactly ONE clarifying question to find out \
-which department they need, then call `transfer_to_department` immediately. Do not attempt to \
-qualify them yourself.
-   - **Sales pitch / vendor cold call** -- deliver a single polite decline (e.g. "we're not \
-looking for that right now, but thank you"), then call `end_call` with outcome "not_qualified".
-   - **Scam / fake-verification attempt** (asking you to confirm sensitive account details, \
-pretending to be a bank/government agency, etc.) -- do not engage or answer their questions. End \
-the call immediately with `end_call` and outcome "dropped".
-
-2. **If it's a real inquiry, qualify them** by asking, one at a time, conversationally (not like \
-a form):
-{qualification_questions}
-   Call `record_lead_info` as you learn each answer -- don't wait until the end.
-
-3. **If the caller asks an off-topic question**, check whether one of your lookup tools covers \
-that topic (each one's description says what it's for) and call it, then answer briefly from what \
-it returns, then steer back to wherever you left off in the flow. If none of them cover it, say \
-you don't have that information rather than guessing, then steer back the same way.
-
-4. **If the caller asks whether you're an AI/a bot/a real person**, answer honestly and briefly, \
-then continue the call -- don't dodge the question and don't dwell on it either.
-
-5. **Once qualification is complete**, decide the right department from the directory below \
-based on what they need, tell the caller you're transferring them (say this out loud BEFORE \
-calling the tool -- the transfer itself is silent), then call `transfer_to_department`.
-
-6. **If `transfer_to_department` reports a failure**, apologize, explain that someone will call \
-them back, ask for the best callback number, call `record_callback_number`, then `end_call`.
-
-7. **If nothing qualifies for a transfer** (e.g. they just wanted information and got it), follow \
-the end-of-call guidance below, close politely, then call `end_call` (outcome "not_qualified" \
-unless the guidance says otherwise).
-
-## Departments you can transfer to
-{departments}
-
-## When to end the call
-This only affects step 7 above -- the scam-termination and failed-transfer cases in steps 1 and 6 \
-always apply regardless of this guidance.
-
-{end_call_instructions}
-"""
-
 
 def _build_instructions(config: AgentConfig) -> str:
-    questions = "\n".join(
-        f"   - {c.question}" + (" (required)" if c.required else "")
-        for c in config.agent.qualification_criteria
-    ) or "   - (No specific qualification questions configured -- use judgment based on the prompt above.)"
+    agent = config.agent
+    parts = [
+        agent.prompt or f"You are {agent.name}.",
+        f"You're on a live phone call -- everything you say is spoken aloud, not read as text. "
+        f"Keep replies to about {agent.conversation_settings.max_reply_sentences} sentence(s) at a time.",
+        "Call end_call once there's nothing further to discuss or the caller wants to hang up -- "
+        "speaking a goodbye out loud does not by itself end the call.",
+    ]
 
-    departments = "\n".join(
-        f"- **{d.department_name}** ({d.transfer_number})"
-        + (f" -- routing hints: {d.routing_keywords}" if d.routing_keywords else "")
-        for d in config.departments
-    ) or "- (No departments configured -- if a transfer seems needed, apologize that no one is available and offer a callback.)"
+    if agent.qualification_criteria:
+        questions = "\n".join(
+            f"- {c.question}" + (" (required)" if c.required else "")
+            for c in agent.qualification_criteria
+        )
+        parts.append(f"Things to find out during the call, if they come up naturally:\n{questions}")
 
-    return INSTRUCTIONS_TEMPLATE.format(
-        custom_prompt=config.agent.prompt or f"You are {config.agent.name}.",
-        max_reply_sentences=config.agent.conversation_settings.max_reply_sentences,
-        qualification_questions=questions,
-        departments=departments,
-        end_call_instructions=config.agent.end_call_instructions or DEFAULT_END_CALL_GUIDANCE,
-    )
+    if agent.end_call_instructions:
+        parts.append(f"When to end the call:\n{agent.end_call_instructions}")
+
+    return "\n\n".join(parts)
 
 
 class InboundCallAgent(Agent):
@@ -137,13 +89,12 @@ class InboundCallAgent(Agent):
             self.session.say(self._first_message_text)
             return
 
-        # Default ("agent_generates"): speaking the greeting explicitly (rather
-        # than depending on the LLM to open on its own) means every call gets
-        # one immediately, even if the model's first turn would otherwise wait
-        # on caller input.
-        self.session.generate_reply(
-            instructions="Greet the caller briefly and ask how you can help."
-        )
+        # Default ("agent_generates"): nudges the model to speak first instead
+        # of waiting on caller input, but doesn't tell it what to say -- no
+        # `instructions` kwarg here, so the opening line comes entirely from
+        # the agent's own system prompt, matching what the dashboard's First
+        # Message option promises ("ad-libbed from the prompt").
+        self.session.generate_reply()
 
     def tts_node(
         self, text: AsyncIterable[str], model_settings: ModelSettings

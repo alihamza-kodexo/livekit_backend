@@ -151,37 +151,31 @@ class Agent:
         )
 
 
-@dataclass(frozen=True)
-class Department:
-    department_id: str
-    agent_id: str
-    department_name: str
-    transfer_number: str
-    routing_keywords: str | None
-
-    @staticmethod
-    def from_row(row: dict[str, Any]) -> "Department":
-        return Department(
-            department_id=row["department_id"],
-            agent_id=row["agent_id"],
-            department_name=row["department_name"],
-            transfer_number=row["transfer_number"],
-            routing_keywords=row.get("routing_keywords"),
-        )
+ToolType = Literal["function", "transfer_call", "record_lead_info", "record_callback_number"]
 
 
 @dataclass(frozen=True)
 class Tool:
-    """A tool definition lives independently of any agent now -- the same
-    webhook (e.g. a booking tool) is often reused across agents, so `tools`
-    rows are global and an `agent_tools` join table records which agent has
-    which selected. See dashboard/lib/queries.ts listAgentTools."""
+    """A tool definition lives independently of any agent -- the same one
+    (e.g. a booking webhook, or a transfer to Sales) is often reused across
+    agents, so `tools` rows are global and an `agent_tools` join table
+    records which agent has which selected. See dashboard/lib/queries.ts
+    listAgentTools.
+
+    `tool_type` picks the underlying behavior (see tools.py's build_agent_tools):
+    "function" calls webhook_url with the model's arguments; the other three
+    are native Python behavior (transfer, lead capture, callback capture)
+    that used to be unconditional on every agent -- now they're admin-created
+    rows like any other tool, opt-in per agent, with an admin-written
+    description instead of a fixed one."""
 
     tool_id: str
     name: str
     description: str
+    tool_type: ToolType
     parameter_schema: dict[str, Any]
     webhook_url: str | None
+    destination_number: str | None
     is_builtin: bool
 
     @staticmethod
@@ -190,8 +184,10 @@ class Tool:
             tool_id=row["tool_id"],
             name=row["name"],
             description=row["description"],
+            tool_type=row.get("tool_type") or "function",
             parameter_schema=row.get("parameter_schema") or {},
             webhook_url=row.get("webhook_url"),
+            destination_number=row.get("destination_number"),
             is_builtin=bool(row.get("is_builtin")),
         )
 
@@ -201,5 +197,4 @@ class AgentConfig:
     """Everything the worker needs to run one call, loaded once per job."""
 
     agent: Agent
-    departments: list[Department]
     tools: list[Tool] = field(default_factory=list)

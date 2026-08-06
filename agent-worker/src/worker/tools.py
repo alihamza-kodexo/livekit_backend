@@ -1,8 +1,12 @@
-"""Built-in tools (transfer, lead/call tracking) plus the generic framework
-that turns a Supabase `tools` row into a callable LLM function tool at
-webhook_url. Matches the Project Plan v2 scope addition: custom tools are a
-dashboard entry, not new worker code, because they all funnel through
-`build_custom_tool` below.
+"""end_call (the one tool every agent always has -- something has to be able
+to hang up regardless of configuration) plus the generic framework that turns
+a Supabase `tools` row into a callable LLM function tool. Transfer, lead
+capture, and callback capture used to be unconditional builtins here too;
+they're now admin-created rows like a webhook Function tool, opt-in per
+agent -- see build_agent_tools' dispatch by `tool_type` below. Each still
+runs fixed Python behavior (there's no webhook for these three), just wrapped
+with whatever name/description the admin gave the row instead of a hardcoded
+one, and only present at all if attached.
 """
 
 from __future__ import annotations
@@ -19,92 +23,6 @@ from .models import Agent, Tool
 from .state import CallState
 
 logger = logging.getLogger("worker.tools")
-
-
-@function_tool(
-    name="transfer_to_department",
-    description=(
-        "Silently transfer the caller to a department by name. Only call this after you have "
-        "already spoken the handoff line out loud to the caller -- the transfer itself is silent, "
-        "but the caller must never be moved without being told first."
-    ),
-)
-async def transfer_to_department(
-    context: RunContext[CallState], department_name: str
-) -> str:
-    state = context.userdata
-    department = next(
-        (
-            d
-            for d in state.config.departments
-            if d.department_name.lower() == department_name.lower()
-        ),
-        None,
-    )
-    if department is None:
-        available = ", ".join(d.department_name for d in state.config.departments) or "none configured"
-        raise ToolError(
-            f"No department named '{department_name}'. Available departments: {available}."
-        )
-
-    job_ctx = get_job_context()
-    participant = _find_sip_participant(job_ctx)
-    if participant is None:
-        raise ToolError("No SIP participant found in the room to transfer.")
-
-    try:
-        await job_ctx.transfer_sip_participant(participant, department.transfer_number)
-    except Exception as e:
-        logger.exception("SIP transfer to %s failed", department.transfer_number)
-        state.outcome = "transfer_failed"
-        state.matched_department = department.department_name
-        raise ToolError(
-            "The transfer failed. Apologize, explain a callback is coming, and ask for the best "
-            "number to reach them at -- then call record_lead_info with that number."
-        ) from e
-
-    state.outcome = "department_transfer"
-    state.matched_department = department.department_name
-    return f"Transferred to {department.department_name}."
-
-
-@function_tool(
-    name="record_lead_info",
-    description=(
-        "Record what you've learned about the caller so far -- their name, company, what they "
-        "need, and answers to qualification questions. Call this as you learn each piece of "
-        "information during the conversation, not just at the end."
-    ),
-)
-async def record_lead_info(
-    context: RunContext[CallState],
-    lead_name: str | None = None,
-    lead_company: str | None = None,
-    lead_need: str | None = None,
-    qualification_answers: dict[str, str] | None = None,
-) -> str:
-    state = context.userdata
-    if lead_name:
-        state.lead_name = lead_name
-    if lead_company:
-        state.lead_company = lead_company
-    if lead_need:
-        state.lead_need = lead_need
-    if qualification_answers:
-        state.qualification_answers.update(qualification_answers)
-    return "Recorded."
-
-
-@function_tool(
-    name="record_callback_number",
-    description=(
-        "Record a callback number after a failed transfer or any time the caller needs to be "
-        "called back. Use this instead of record_lead_info for a callback number specifically."
-    ),
-)
-async def record_callback_number(context: RunContext[CallState], callback_number: str) -> str:
-    context.userdata.transfer_failed_callback_number = callback_number
-    return "Recorded."
 
 
 @function_tool(
@@ -139,16 +57,17 @@ def _find_sip_participant(job_ctx: Any):
 
 
 def builtin_tools() -> list:
-    return [transfer_to_department, record_lead_info, record_callback_number, end_call]
+    return [end_call]
 
 
 def build_custom_tool(tool_row: Tool) -> RawFunctionTool:
-    """Turns one non-builtin `tools` row into a live function tool that calls
-    its configured webhook. This is the entire mechanism custom tools need --
-    there's no per-tool Python code, which is the point of the framework."""
+    """Turns a `tool_type: "function"` row into a live function tool that
+    calls its configured webhook. This is the entire mechanism Function tools
+    need -- there's no per-tool Python code, which is the point of the
+    framework."""
 
     if not tool_row.webhook_url:
-        raise ValueError(f"Custom tool '{tool_row.name}' has no webhook_url configured")
+        raise ValueError(f"Function tool '{tool_row.name}' has no webhook_url configured")
 
     async def _call_webhook(raw_arguments: dict[str, Any], context: RunContext[CallState]) -> str:
         try:
@@ -162,7 +81,7 @@ def build_custom_tool(tool_row: Tool) -> RawFunctionTool:
                 except ValueError:
                     return response.text
         except httpx.HTTPError as e:
-            logger.warning("custom tool '%s' webhook call failed: %s", tool_row.name, e)
+            logger.warning("Function tool '%s' webhook call failed: %s", tool_row.name, e)
             raise ToolError(
                 f"The {tool_row.name} tool is temporarily unavailable. "
                 "Apologize and continue without it, or offer a callback."
@@ -180,19 +99,143 @@ def build_custom_tool(tool_row: Tool) -> RawFunctionTool:
     )
 
 
+def build_transfer_call_tool(tool_row: Tool) -> RawFunctionTool:
+    """A `tool_type: "transfer_call"` row -- SIP-transfers to the fixed
+    number the admin set on this specific tool. One tool per destination
+    (like Vapi's Transfer Call), each with its own admin-written description
+    driving when the model reaches for it, rather than one generic tool
+    matched against a routing-keywords directory."""
+
+    if not tool_row.destination_number:
+        raise ValueError(f"Transfer call tool '{tool_row.name}' has no destination_number configured")
+
+    async def _transfer(raw_arguments: dict[str, Any], context: RunContext[CallState]) -> str:
+        state = context.userdata
+        job_ctx = get_job_context()
+        participant = _find_sip_participant(job_ctx)
+        if participant is None:
+            raise ToolError("No SIP participant found in the room to transfer.")
+
+        try:
+            await job_ctx.transfer_sip_participant(participant, tool_row.destination_number)
+        except Exception as e:
+            logger.exception("SIP transfer to %s failed", tool_row.destination_number)
+            state.outcome = "transfer_failed"
+            state.matched_department = tool_row.name
+            raise ToolError(
+                "The transfer failed. Apologize, explain a callback is coming, and ask for the "
+                "best number to reach them at -- then record it if you have a way to."
+            ) from e
+
+        state.outcome = "department_transfer"
+        state.matched_department = tool_row.name
+        return "Transferred."
+
+    _transfer.__name__ = tool_row.name
+
+    return function_tool(
+        _transfer,
+        raw_schema={
+            "name": tool_row.name,
+            "description": (
+                f"{tool_row.description} The transfer itself happens silently -- tell the caller "
+                "you're transferring them before calling this, not after."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    )
+
+
+def build_record_lead_info_tool(tool_row: Tool) -> RawFunctionTool:
+    """A `tool_type: "record_lead_info"` row -- same fixed behavior (writes
+    onto CallState, ends up in call_logs) as the old unconditional builtin,
+    just opt-in per agent with an admin-written description now instead of a
+    fixed one, so an agent that isn't doing lead qualification doesn't have
+    this nudging it to ask for a name/company/need it has no use for."""
+
+    async def _record(raw_arguments: dict[str, Any], context: RunContext[CallState]) -> str:
+        state = context.userdata
+        lead_name = raw_arguments.get("lead_name")
+        lead_company = raw_arguments.get("lead_company")
+        lead_need = raw_arguments.get("lead_need")
+        qualification_answers = raw_arguments.get("qualification_answers")
+        if lead_name:
+            state.lead_name = lead_name
+        if lead_company:
+            state.lead_company = lead_company
+        if lead_need:
+            state.lead_need = lead_need
+        if qualification_answers:
+            state.qualification_answers.update(qualification_answers)
+        return "Recorded."
+
+    _record.__name__ = tool_row.name
+
+    return function_tool(
+        _record,
+        raw_schema={
+            "name": tool_row.name,
+            "description": tool_row.description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "lead_name": {"type": "string"},
+                    "lead_company": {"type": "string"},
+                    "lead_need": {"type": "string"},
+                    "qualification_answers": {"type": "object"},
+                },
+            },
+        },
+    )
+
+
+def build_record_callback_number_tool(tool_row: Tool) -> RawFunctionTool:
+    """A `tool_type: "record_callback_number"` row -- same fixed behavior
+    (feeds the transfer-failed Slack alert) as the old unconditional builtin,
+    opt-in per agent now."""
+
+    async def _record(raw_arguments: dict[str, Any], context: RunContext[CallState]) -> str:
+        context.userdata.transfer_failed_callback_number = raw_arguments.get("callback_number")
+        return "Recorded."
+
+    _record.__name__ = tool_row.name
+
+    return function_tool(
+        _record,
+        raw_schema={
+            "name": tool_row.name,
+            "description": tool_row.description,
+            "parameters": {
+                "type": "object",
+                "required": ["callback_number"],
+                "properties": {"callback_number": {"type": "string"}},
+            },
+        },
+    )
+
+
+_TOOL_BUILDERS = {
+    "function": build_custom_tool,
+    "transfer_call": build_transfer_call_tool,
+    "record_lead_info": build_record_lead_info_tool,
+    "record_callback_number": build_record_callback_number_tool,
+}
+
+
 def build_agent_tools(tool_rows: list[Tool]) -> list:
-    """Custom tools only -- built-ins are added separately per Agent phase
-    since not every phase should be able to call every tool (e.g. only the
-    qualification phase should transfer)."""
+    """Every attached tool, regardless of type -- dispatches on `tool_type`
+    to the matching builder above."""
 
     tools = []
     for row in tool_rows:
-        if row.is_builtin:
+        builder = _TOOL_BUILDERS.get(row.tool_type)
+        if builder is None:
+            logger.error("unknown tool_type %r for tool row %s", row.tool_type, row.tool_id)
             continue
         try:
-            tools.append(build_custom_tool(row))
+            tools.append(builder(row))
         except ValueError:
-            logger.exception("skipping malformed custom tool row %s", row.tool_id)
+            logger.exception("skipping malformed tool row %s", row.tool_id)
     return tools
 
 

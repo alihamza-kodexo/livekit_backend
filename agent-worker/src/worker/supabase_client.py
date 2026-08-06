@@ -16,7 +16,6 @@ from .models import (
     Agent,
     AgentConfig,
     CallOutcome,
-    Department,
     Tool,
 )
 from .settings import supabase_settings
@@ -70,11 +69,11 @@ async def load_agent_config_by_id(agent_id: str) -> AgentConfig | None:
 async def _load_config_for_agent_row(client: AsyncClient, agent_row: dict[str, Any]) -> AgentConfig:
     agent = Agent.from_row(agent_row)
 
-    departments_result = (
-        await client.table("departments").select("*").eq("agent_id", agent.agent_id).execute()
-    )
     # Tools are a global library now (see 0014_global_tools.sql) -- this joins
-    # through agent_tools to whichever ones this agent has selected.
+    # through agent_tools to whichever ones this agent has selected. Every
+    # tool_type (including transfer_call, which replaced the old departments
+    # directory -- see 0016_tool_types_and_transfer_call.sql) comes through
+    # here identically.
     agent_tools_result = (
         await client.table("agent_tools")
         .select("tools(*)")
@@ -84,7 +83,6 @@ async def _load_config_for_agent_row(client: AsyncClient, agent_row: dict[str, A
 
     return AgentConfig(
         agent=agent,
-        departments=[Department.from_row(r) for r in departments_result.data],
         tools=[
             Tool.from_row(row["tools"]) for row in agent_tools_result.data if row.get("tools")
         ],
