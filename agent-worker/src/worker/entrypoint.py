@@ -236,12 +236,6 @@ async def entrypoint(ctx: JobContext) -> None:
 
 
 async def _log_and_notify(state: CallState, session: AgentSession[CallState], started_at: float) -> None:
-    if state.is_test:
-        # Dashboard test sessions aren't real calls -- skip call_logs/Slack so
-        # they don't pollute real call history and notifications.
-        logger.info("test session for agent %s ended, not logging", state.config.agent.agent_id)
-        return
-
     duration_seconds = int(time.monotonic() - started_at)
     transcript = _render_transcript(session)
 
@@ -257,7 +251,36 @@ async def _log_and_notify(state: CallState, session: AgentSession[CallState], st
         lead_name=state.lead_name,
         lead_company=state.lead_company,
         lead_need=state.lead_need,
+        is_test=state.is_test,
     )
+
+    # Fires even for test calls -- this is the agent owner's own configured
+    # integration (e.g. a CRM sync), not an internal alert channel like Slack
+    # below, and a test call is a real invocation of it just like a custom
+    # tool call already is during testing.
+    await notify.send_end_call_webhook(
+        agent=state.config.agent,
+        call_sid=state.call_sid,
+        room_id=state.room_name,
+        caller_number=state.caller_number,
+        transcript=transcript,
+        recording_url=None,
+        duration_seconds=duration_seconds,
+        outcome=state.outcome,
+        matched_department=state.matched_department,
+        lead_name=state.lead_name,
+        lead_company=state.lead_company,
+        lead_need=state.lead_need,
+        qualification_answers=state.qualification_answers,
+        is_test=state.is_test,
+    )
+
+    if state.is_test:
+        # Dashboard test sessions aren't real calls -- they're logged above so
+        # they show up (marked as such) in the dashboard, but Slack alerts are
+        # for real customer calls only.
+        logger.info("test session for agent %s logged, not notifying", state.config.agent.agent_id)
+        return
 
     if state.outcome == "transfer_failed" and state.matched_department:
         await notify.send_transfer_failure_alert(

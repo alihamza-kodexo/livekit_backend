@@ -113,6 +113,15 @@ class Agent:
     # end_call *does* (still just hangs up) -- only the conditions the model is
     # told to watch for before calling it.
     end_call_instructions: str | None
+    # Free-form reference text for off-topic questions, exposed to the model as
+    # one on-demand tool (see tools.build_knowledge_tool) rather than
+    # concatenated into every turn's prompt -- knowledge_base_description is
+    # what the model actually sees to decide whether to call it.
+    knowledge_base_content: str
+    knowledge_base_description: str
+    # Posted the full call record (transcript, outcome, lead info, etc.) once
+    # the call ends -- see notify.send_end_call_webhook. Null means "don't send".
+    end_call_webhook_url: str | None
 
     @staticmethod
     def from_row(row: dict[str, Any]) -> "Agent":
@@ -136,6 +145,9 @@ class Agent:
             ],
             conversation_settings=ConversationSettings.from_row(row.get("conversation_settings") or {}),
             end_call_instructions=row.get("end_call_instructions"),
+            knowledge_base_content=row.get("knowledge_base_content") or "",
+            knowledge_base_description=row.get("knowledge_base_description") or "",
+            end_call_webhook_url=row.get("end_call_webhook_url"),
         )
 
 
@@ -159,23 +171,13 @@ class Department:
 
 
 @dataclass(frozen=True)
-class KnowledgeBaseEntry:
-    kb_id: str
-    agent_id: str
-    title: str
-    content: str
-
-    @staticmethod
-    def from_row(row: dict[str, Any]) -> "KnowledgeBaseEntry":
-        return KnowledgeBaseEntry(
-            kb_id=row["kb_id"], agent_id=row["agent_id"], title=row["title"], content=row["content"]
-        )
-
-
-@dataclass(frozen=True)
 class Tool:
+    """A tool definition lives independently of any agent now -- the same
+    webhook (e.g. a booking tool) is often reused across agents, so `tools`
+    rows are global and an `agent_tools` join table records which agent has
+    which selected. See dashboard/lib/queries.ts listAgentTools."""
+
     tool_id: str
-    agent_id: str
     name: str
     description: str
     parameter_schema: dict[str, Any]
@@ -186,7 +188,6 @@ class Tool:
     def from_row(row: dict[str, Any]) -> "Tool":
         return Tool(
             tool_id=row["tool_id"],
-            agent_id=row["agent_id"],
             name=row["name"],
             description=row["description"],
             parameter_schema=row.get("parameter_schema") or {},
@@ -201,5 +202,4 @@ class AgentConfig:
 
     agent: Agent
     departments: list[Department]
-    knowledge_base: list[KnowledgeBaseEntry]
     tools: list[Tool] = field(default_factory=list)

@@ -12,6 +12,7 @@ real FSD text before launch, not as already-verified copy.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import httpx
 
@@ -63,6 +64,63 @@ async def send_call_summary(
         lines.append(f"*Need:* {lead_need}")
 
     await _post_to_slack({"text": "\n".join(lines)})
+
+
+async def send_end_call_webhook(
+    *,
+    agent: Agent,
+    call_sid: str | None,
+    room_id: str,
+    caller_number: str | None,
+    transcript: str,
+    recording_url: str | None,
+    duration_seconds: int,
+    outcome: CallOutcome | None,
+    matched_department: str | None,
+    lead_name: str | None,
+    lead_company: str | None,
+    lead_need: str | None,
+    qualification_answers: dict[str, Any],
+    is_test: bool,
+) -> None:
+    """Posts the full call record to the agent's own configured webhook
+    (Prompt & qualification tab), for whoever wants call data outside Slack/
+    the dashboard -- e.g. a CRM sync in n8n. Distinct from Slack: this fires
+    even for dashboard test calls, matching how a custom tool call already
+    isn't sandboxed there either -- see agent-worker's tools.py.
+
+    NOTE: recording_url is always None right now. There's no LiveKit Egress
+    (or any other) recording pipeline wired up in this build, so there's no
+    actual audio file to link -- the field is included so a receiving
+    workflow's shape doesn't need to change once recording exists, not
+    because it's populated today.
+    """
+    if not agent.end_call_webhook_url:
+        return
+
+    payload = {
+        "agent_id": agent.agent_id,
+        "agent_name": agent.name,
+        "call_sid": call_sid,
+        "room_id": room_id,
+        "caller_number": caller_number,
+        "transcript": transcript,
+        "recording_url": recording_url,
+        "duration_seconds": duration_seconds,
+        "outcome": outcome,
+        "matched_department": matched_department,
+        "lead_name": lead_name,
+        "lead_company": lead_company,
+        "lead_need": lead_need,
+        "qualification_answers": qualification_answers,
+        "is_test": is_test,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(agent.end_call_webhook_url, json=payload)
+            response.raise_for_status()
+    except Exception:
+        logger.exception("failed to post end-call webhook for agent %s", agent.agent_id)
 
 
 async def send_transfer_failure_alert(

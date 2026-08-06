@@ -17,7 +17,6 @@ from .models import (
     AgentConfig,
     CallOutcome,
     Department,
-    KnowledgeBaseEntry,
     Tool,
 )
 from .settings import supabase_settings
@@ -74,16 +73,21 @@ async def _load_config_for_agent_row(client: AsyncClient, agent_row: dict[str, A
     departments_result = (
         await client.table("departments").select("*").eq("agent_id", agent.agent_id).execute()
     )
-    kb_result = (
-        await client.table("knowledge_base").select("*").eq("agent_id", agent.agent_id).execute()
+    # Tools are a global library now (see 0014_global_tools.sql) -- this joins
+    # through agent_tools to whichever ones this agent has selected.
+    agent_tools_result = (
+        await client.table("agent_tools")
+        .select("tools(*)")
+        .eq("agent_id", agent.agent_id)
+        .execute()
     )
-    tools_result = await client.table("tools").select("*").eq("agent_id", agent.agent_id).execute()
 
     return AgentConfig(
         agent=agent,
         departments=[Department.from_row(r) for r in departments_result.data],
-        knowledge_base=[KnowledgeBaseEntry.from_row(r) for r in kb_result.data],
-        tools=[Tool.from_row(r) for r in tools_result.data],
+        tools=[
+            Tool.from_row(row["tools"]) for row in agent_tools_result.data if row.get("tools")
+        ],
     )
 
 
@@ -100,6 +104,7 @@ async def insert_call_log(
     lead_name: str | None,
     lead_company: str | None,
     lead_need: str | None,
+    is_test: bool = False,
 ) -> None:
     """Writes the post-call record directly to Supabase. There is no n8n hop
     in this build -- see settings.SlackSettings -- so this and
@@ -120,6 +125,7 @@ async def insert_call_log(
                 "lead_name": lead_name,
                 "lead_company": lead_company,
                 "lead_need": lead_need,
+                "is_test": is_test,
             }
         ).execute()
     except Exception:

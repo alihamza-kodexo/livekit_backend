@@ -56,8 +56,10 @@ a form):
 {qualification_questions}
    Call `record_lead_info` as you learn each answer -- don't wait until the end.
 
-3. **If the caller asks an off-topic question**, answer it briefly using the reference material \
-below, then steer back to wherever you left off in the flow. Don't just refuse to answer.
+3. **If the caller asks an off-topic question**, check whether one of your lookup tools covers \
+that topic (each one's description says what it's for) and call it, then answer briefly from what \
+it returns, then steer back to wherever you left off in the flow. If none of them cover it, say \
+you don't have that information rather than guessing, then steer back the same way.
 
 4. **If the caller asks whether you're an AI/a bot/a real person**, answer honestly and briefly, \
 then continue the call -- don't dodge the question and don't dwell on it either.
@@ -75,9 +77,6 @@ unless the guidance says otherwise).
 
 ## Departments you can transfer to
 {departments}
-
-## Reference material for off-topic questions
-{knowledge_base}
 
 ## When to end the call
 This only affects step 7 above -- the scam-termination and failed-transfer cases in steps 1 and 6 \
@@ -99,16 +98,11 @@ def _build_instructions(config: AgentConfig) -> str:
         for d in config.departments
     ) or "- (No departments configured -- if a transfer seems needed, apologize that no one is available and offer a callback.)"
 
-    knowledge_base = "\n".join(
-        f"### {entry.title}\n{entry.content}" for entry in config.knowledge_base
-    ) or "(No knowledge base entries configured.)"
-
     return INSTRUCTIONS_TEMPLATE.format(
         custom_prompt=config.agent.prompt or f"You are {config.agent.name}.",
         max_reply_sentences=config.agent.conversation_settings.max_reply_sentences,
         qualification_questions=questions,
         departments=departments,
-        knowledge_base=knowledge_base,
         end_call_instructions=config.agent.end_call_instructions or DEFAULT_END_CALL_GUIDANCE,
     )
 
@@ -124,7 +118,11 @@ class InboundCallAgent(Agent):
         self._first_message_text = config.agent.first_message_text
         super().__init__(
             instructions=_build_instructions(config),
-            tools=[*tools.builtin_tools(), *tools.build_agent_tools(config.tools)],
+            tools=[
+                *tools.builtin_tools(),
+                *tools.build_agent_tools(config.tools),
+                *tools.build_knowledge_tool(config.agent),
+            ],
         )
 
     async def on_enter(self) -> None:

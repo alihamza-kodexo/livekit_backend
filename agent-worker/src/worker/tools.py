@@ -15,7 +15,7 @@ from livekit import rtc
 from livekit.agents import RunContext, get_job_context
 from livekit.agents.llm import RawFunctionTool, ToolError, function_tool
 
-from .models import Tool
+from .models import Agent, Tool
 from .state import CallState
 
 logger = logging.getLogger("worker.tools")
@@ -194,3 +194,33 @@ def build_agent_tools(tool_rows: list[Tool]) -> list:
         except ValueError:
             logger.exception("skipping malformed custom tool row %s", row.tool_id)
     return tools
+
+
+def build_knowledge_tool(agent: Agent) -> list[RawFunctionTool]:
+    """A single on-demand tool wrapping the agent's whole knowledge base --
+    there's one knowledge base per agent, not several documents to pick
+    between, so one tool is enough. Its content is only sent to the model
+    (and only costs tokens) on the calls where it's actually invoked, instead
+    of being concatenated into every turn's prompt regardless of whether it's
+    ever needed. Returns an empty list if no content is configured, so an
+    agent with nothing to look up doesn't get an empty/useless tool."""
+
+    if not agent.knowledge_base_content.strip():
+        return []
+
+    async def _search_knowledge_base(
+        raw_arguments: dict[str, Any], context: RunContext[CallState]
+    ) -> str:
+        return agent.knowledge_base_content
+
+    return [
+        function_tool(
+            _search_knowledge_base,
+            raw_schema={
+                "name": "search_knowledge_base",
+                "description": agent.knowledge_base_description
+                or "Reference material for off-topic caller questions.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        )
+    ]
