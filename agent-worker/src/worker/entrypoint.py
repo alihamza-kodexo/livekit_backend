@@ -19,10 +19,15 @@ from livekit.agents import (
     InterruptionOptions,
     JobContext,
     JobProcess,
+    MetricsCollectedEvent,
+    PreemptiveGenerationOptions,
     RoomInputOptions,
+    RoomOutputOptions,
     TurnHandlingOptions,
     WorkerOptions,
     cli,
+    metrics,
+    stt,
 )
 from livekit.plugins import deepgram, google, groq, noise_cancellation, openai, silero
 
@@ -128,16 +133,49 @@ def _build_session_kwargs(config: AgentConfig, provider: ProviderSettings, vad: 
 
     return {
         "vad": vad,
-        "stt": deepgram.STT(
-            api_key=provider.deepgram_api_key,
-            # NOT `or None` -- deepgram.STT does `list(keyterm)` unconditionally
-            # when it isn't a str, which crashes on None. An empty list (no
-            # pronunciation dictionary entries) is the correct "no boosting" value.
-            keyterm=stt_keyterm_list(config),
-        ),
+        "stt": _build_stt(config, provider),
         "llm": llm,
         "tts": deepgram.TTS(**tts_kwargs),
     }
+
+
+def _build_stt(config: AgentConfig, provider: ProviderSettings) -> stt.STT:
+    """Deepgram STT, with Flux in front when it's enabled.
+
+    Flux matters for one reason: it reports end-of-turn from the speech itself,
+    so the session no longer has to sit on a fixed silence timer before handing
+    the transcript to the LLM. On a phone call that timer is pure additive delay
+    on top of PSTN transit, SIP transcoding and two jitter buffers, none of
+    which we can shrink -- so it's the largest piece actually within reach.
+    `eager_eot_threshold` goes further and lets the LLM start on a
+    provisionally-complete utterance.
+
+    Wrapped in a FallbackAdapter rather than swapped outright: if Flux is
+    unavailable on the account or the socket fails mid-call, nova-3 takes over
+    and still emits END_OF_SPEECH, so turn-taking keeps working -- just without
+    the model-based decision. Set DEEPGRAM_STT_ENGINE=nova to skip Flux
+    entirely.
+    """
+    nova = deepgram.STT(
+        api_key=provider.deepgram_api_key,
+        # NOT `or None` -- deepgram.STT does `list(keyterm)` unconditionally
+        # when it isn't a str, which crashes on None. An empty list (no
+        # pronunciation dictionary entries) is the correct "no boosting" value.
+        keyterm=stt_keyterm_list(config),
+    )
+
+    if provider.stt_engine != "flux":
+        return nova
+
+    flux = deepgram.STTv2(
+        api_key=provider.deepgram_api_key,
+        model=provider.deepgram_flux_model,
+        eot_threshold=provider.flux_eot_threshold,
+        eager_eot_threshold=provider.flux_eager_eot_threshold,
+        eot_timeout_ms=provider.flux_eot_timeout_ms,
+        keyterm=stt_keyterm_list(config),
+    )
+    return stt.FallbackAdapter([flux, nova])
 
 
 def prewarm(proc: JobProcess) -> None:
@@ -147,7 +185,26 @@ def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load()
 
 
-def _turn_handling_from_settings(config: AgentConfig) -> TurnHandlingOptions:
+def _turn_handling_from_settings(
+    config: AgentConfig, provider: ProviderSettings
+) -> TurnHandlingOptions:
+    """How the session decides a turn ended, and how eagerly it gets ahead.
+
+    Three deliberate choices here, all aimed at the delay a caller actually
+    feels between finishing a sentence and hearing a reply:
+
+    - `turn_detection="stt"` when Flux is in use. Without it the session
+      auto-selects VAD (it prefers VAD whenever a VAD model is passed, which it
+      always is here for interruption detection), and Flux's end-of-turn signal
+      would be ignored entirely.
+    - `mode="dynamic"` endpointing shortens the wait when the utterance already
+      sounds finished, instead of always spending the full delay.
+    - `preemptive_tts` puts the *audio* generation in front of turn
+      confirmation too. LLM preemption is already on by default in this SDK;
+      this is the remaining half. It costs the occasional discarded synthesis
+      when a caller resumes talking, in exchange for first-audio arriving
+      sooner on the turns where they don't.
+    """
     settings = config.agent.conversation_settings
 
     # interruption_sensitivity is 0..1 on the dashboard (higher = more sensitive);
@@ -155,9 +212,44 @@ def _turn_handling_from_settings(config: AgentConfig) -> TurnHandlingOptions:
     # (lower = more sensitive). Linearly map across the SDK's own default range.
     min_duration = 1.0 - settings.interruption_sensitivity * 0.8
 
-    return TurnHandlingOptions(
-        endpointing=EndpointingOptions(min_delay=settings.vad_threshold_ms / 1000.0),
+    options = TurnHandlingOptions(
+        endpointing=EndpointingOptions(
+            mode="dynamic",
+            min_delay=settings.vad_threshold_ms / 1000.0,
+        ),
         interruption=InterruptionOptions(min_duration=max(0.1, min_duration)),
+        preemptive_generation=PreemptiveGenerationOptions(preemptive_tts=True),
+    )
+
+    if provider.stt_engine == "flux":
+        options["turn_detection"] = "stt"
+
+    return options
+
+
+def _log_turn_metrics(state: CallState, event: MetricsCollectedEvent) -> None:
+    """Per-turn timings, so "the phone feels slower than the browser" can be
+    answered with numbers instead of inference.
+
+    `transport` is the whole point of logging this: the same agent on a SIP call
+    and in a browser test runs an identical STT/LLM/TTS pipeline, so any
+    difference has to be end-of-turn detection or the audio path. Comparing
+    these lines across the two says which.
+    """
+    metrics.log_metrics(event.metrics)
+
+    eou = getattr(event.metrics, "end_of_utterance_delay", None)
+    ttft = getattr(event.metrics, "ttft", None)
+    ttfb = getattr(event.metrics, "ttfb", None)
+    if eou is None and ttft is None and ttfb is None:
+        return
+
+    logger.info(
+        "turn timing transport=%s eou=%s ttft=%s ttfb=%s",
+        "web" if state.is_test else "sip",
+        f"{eou:.3f}" if isinstance(eou, (int, float)) else "-",
+        f"{ttft:.3f}" if isinstance(ttft, (int, float)) else "-",
+        f"{ttfb:.3f}" if isinstance(ttfb, (int, float)) else "-",
     )
 
 
@@ -223,9 +315,13 @@ async def entrypoint(ctx: JobContext) -> None:
 
     session: AgentSession[CallState] = AgentSession(
         userdata=state,
-        turn_handling=_turn_handling_from_settings(config),
+        turn_handling=_turn_handling_from_settings(config, provider),
         **_build_session_kwargs(config, provider, vad),
     )
+
+    @session.on("metrics_collected")
+    def _on_metrics(event: MetricsCollectedEvent) -> None:
+        _log_turn_metrics(state, event)
 
     async def _on_shutdown() -> None:
         await _log_and_notify(state, session, started_at)
@@ -236,6 +332,19 @@ async def entrypoint(ctx: JobContext) -> None:
         InboundCallAgent(config),
         room=ctx.room,
         room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
+        # DTX off, RED on. DTX stops sending during silence, which is cheaper but
+        # leaves the far side's adaptive jitter buffer without a steady stream to
+        # converge on -- it then keeps a larger safety margin, and that margin is
+        # added delay on every reply. RED adds redundant payloads so a lost
+        # packet doesn't force the buffer to grow either. Both matter far more on
+        # a SIP leg than on a browser's local WebRTC connection.
+        room_output_options=RoomOutputOptions(
+            audio_publish_options=rtc.TrackPublishOptions(
+                source=rtc.TrackSource.SOURCE_MICROPHONE,
+                dtx=False,
+                red=True,
+            ),
+        ),
     )
 
 

@@ -64,6 +64,24 @@ class ProviderSettings:
     gemini_api_key: str | None
     gemini_model: str
 
+    # --- Turn taking -------------------------------------------------------
+    # Which Deepgram STT to run. "flux" uses Deepgram's Flux model, which
+    # decides end-of-turn from the speech itself and lets the session stop
+    # waiting on a fixed silence timer -- the single biggest latency win
+    # available on a phone call, where every stage is already paying for PSTN
+    # and jitter-buffer delay. "nova" is the previous streaming-transcript
+    # behaviour, kept as a one-variable rollback.
+    stt_engine: str
+    deepgram_flux_model: str
+    # Confidence at which Flux calls the turn finished. Higher waits longer and
+    # interrupts less; 0.7 is the value Deepgram and Vapi both settle on.
+    flux_eot_threshold: float
+    # Lower bar at which Flux emits a *provisional* end-of-turn, letting the
+    # LLM start on a likely-complete utterance. Must sit below eot_threshold.
+    flux_eager_eot_threshold: float
+    # Hard ceiling on waiting for the confidence threshold after speech stops.
+    flux_eot_timeout_ms: int
+
 
 @dataclass(frozen=True)
 class SlackSettings:
@@ -103,6 +121,13 @@ def provider_settings() -> ProviderSettings:
         deepseek_base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         gemini_api_key=os.environ.get("GEMINI_API_KEY") or None,
         gemini_model=os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-live-preview"),
+        stt_engine=(os.environ.get("DEEPGRAM_STT_ENGINE") or "flux").strip().lower(),
+        deepgram_flux_model=os.environ.get("DEEPGRAM_FLUX_MODEL", "flux-general-en"),
+        flux_eot_threshold=float(os.environ.get("DEEPGRAM_FLUX_EOT_THRESHOLD", "0.7")),
+        flux_eager_eot_threshold=float(
+            os.environ.get("DEEPGRAM_FLUX_EAGER_EOT_THRESHOLD", "0.5")
+        ),
+        flux_eot_timeout_ms=int(os.environ.get("DEEPGRAM_FLUX_EOT_TIMEOUT_MS", "600")),
     )
 
 

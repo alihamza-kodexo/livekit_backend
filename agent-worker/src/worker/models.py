@@ -62,7 +62,10 @@ CONVERSATION_SETTING_DEFAULTS: dict[str, float] = {
     "max_reply_sentences": 2,
     "tts_stability": 0.6,
     "speech_rate": 1.0,
-    "vad_threshold_ms": 500,
+    # 300ms, not 500: this is now a floor under Flux's own end-of-turn decision
+    # rather than the whole decision (see entrypoint._build_stt), and 500ms of
+    # dead air was landing on top of PSTN transit on every phone turn.
+    "vad_threshold_ms": 300,
     "interruption_sensitivity": 0.5,
     "backchannel_frequency": 0.2,
 }
