@@ -217,16 +217,32 @@ def _gemini_activity_detection(
     start-of-activity *is* Gemini's interrupt signal, every false positive stops
     the agent mid-sentence.
     """
+    # Driven by the dashboard slider rather than pinned to LOW. Pinning it there
+    # fixed barge-in on noise and then went too far: a quiet microphone stopped
+    # registering as speech at all, so the agent greeted the caller and never
+    # heard a word after that. Since turn_coverage only forwards audio to the
+    # model *during* detected activity, a start-of-speech decision that never
+    # fires means Gemini receives nothing -- the failure is total, not gradual.
+    #
+    # So the default (0.5) now matches Gemini's own HIGH, and lowering the slider
+    # is what buys noise rejection, at the cost of needing clearer speech.
+    sensitive = settings.interruption_sensitivity >= 0.35
     return genai_types.RealtimeInputConfig(
         automatic_activity_detection=genai_types.AutomaticActivityDetection(
-            # LOW at both ends: harder to trip on noise, and slower to declare
-            # the caller finished just because they paused for breath.
-            start_of_speech_sensitivity=genai_types.StartSensitivity.START_SENSITIVITY_LOW,
+            start_of_speech_sensitivity=(
+                genai_types.StartSensitivity.START_SENSITIVITY_HIGH
+                if sensitive
+                else genai_types.StartSensitivity.START_SENSITIVITY_LOW
+            ),
+            # Stays LOW regardless: this end is about not cutting a caller off
+            # mid-pause, and being patient there costs a little latency rather
+            # than losing input entirely.
             end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_LOW,
-            # How long speech must persist before it commits as
-            # start-of-activity. This is the actual noise gate, and the closest
-            # thing Gemini has to InterruptionOptions.min_duration.
-            prefix_padding_ms=int(_interruption_min_duration(settings) * 1000),
+            # How long speech must persist before it commits as start-of-activity
+            # -- the noise gate, and the closest thing Gemini has to
+            # InterruptionOptions.min_duration. Scaled so the default is a modest
+            # 300ms instead of the 600ms that was swallowing real speech.
+            prefix_padding_ms=int(round((1.0 - settings.interruption_sensitivity) * 500 + 50)),
             # Floored at 500ms on purpose. The 300ms default exists for Flux,
             # which decides end-of-turn from the words themselves; Gemini's
             # detector is a silence timer with no semantic component, so 300ms
