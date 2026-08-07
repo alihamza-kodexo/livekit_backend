@@ -12,6 +12,7 @@ import json
 import logging
 import time
 
+from google.genai import types as genai_types
 from livekit import rtc
 from livekit.agents import (
     AgentSession,
@@ -33,7 +34,7 @@ from livekit.plugins import deepgram, google, groq, noise_cancellation, openai, 
 
 from . import deflection, notify
 from .flow import InboundCallAgent, stt_keyterm_list
-from .models import AgentConfig
+from .models import AgentConfig, ConversationSettings
 from .settings import ProviderSettings, livekit_settings, provider_settings
 from .state import CallState
 from .supabase_client import insert_call_log, load_agent_config_by_id, load_agent_config_by_number
@@ -84,12 +85,18 @@ def _build_session_kwargs(config: AgentConfig, provider: ProviderSettings, vad: 
             "api_key": provider.gemini_api_key,
             "model": provider.gemini_model,
             "temperature": settings.temperature,
+            # Not optional on a phone call -- see the docstring below for why
+            # this is the only place a Gemini Live agent's turn-taking can be
+            # set at all.
+            "realtime_input_config": _gemini_activity_detection(settings),
         }
         # Gemini Live's own prebuilt voice set, picked per agent in the
         # dashboard. Omitted entirely when unset so the plugin's default (Puck)
         # applies rather than us hardcoding a second default here.
         if config.agent.gemini_voice:
             realtime_kwargs["voice"] = config.agent.gemini_voice
+        if provider.gemini_proactive_audio:
+            realtime_kwargs["proactivity"] = True
         return {"llm": google.realtime.RealtimeModel(**realtime_kwargs)}
 
     if config.agent.llm_provider == "deepseek":
@@ -137,6 +144,57 @@ def _build_session_kwargs(config: AgentConfig, provider: ProviderSettings, vad: 
         "llm": llm,
         "tts": deepgram.TTS(**tts_kwargs),
     }
+
+
+def _interruption_min_duration(settings: ConversationSettings) -> float:
+    """Seconds of caller speech that have to land before it counts as barge-in.
+
+    `interruption_sensitivity` is 0..1 on the dashboard (higher = more
+    sensitive); this inverts it into seconds across the SDK's own default range.
+    Shared by both engines so the slider means the same thing either way -- the
+    pipeline hands it to InterruptionOptions, Gemini Live to its own detector.
+    """
+    return max(0.1, 1.0 - settings.interruption_sensitivity * 0.8)
+
+
+def _gemini_activity_detection(
+    settings: ConversationSettings,
+) -> genai_types.RealtimeInputConfig:
+    """Gemini Live's own turn detector, tuned for a phone line.
+
+    This is not a refinement -- it's the only place a Gemini Live agent's
+    turn-taking can be set at all. The plugin reports
+    `can_disable_turn_detection=False` (its `RealtimeModel.session()` notes that
+    Gemini drives manual turns through activity_start/activity_end, which the
+    pipeline can't gatekeep yet), so on a realtime call *every* turn-taking
+    decision is made server-side and AgentSession's endpointing and interruption
+    options are discarded with a warning. Anything we want has to be said here.
+
+    Gemini Live's own defaults are START_SENSITIVITY_HIGH and
+    END_SENSITIVITY_HIGH -- the most eager setting on both ends. That is
+    reasonable for a headset in a quiet room and wrong for an 8kHz phone leg,
+    where room noise, a television or a second voice all read as speech. Since
+    start-of-activity *is* Gemini's interrupt signal, every false positive stops
+    the agent mid-sentence.
+    """
+    return genai_types.RealtimeInputConfig(
+        automatic_activity_detection=genai_types.AutomaticActivityDetection(
+            # LOW at both ends: harder to trip on noise, and slower to declare
+            # the caller finished just because they paused for breath.
+            start_of_speech_sensitivity=genai_types.StartSensitivity.START_SENSITIVITY_LOW,
+            end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_LOW,
+            # How long speech must persist before it commits as
+            # start-of-activity. This is the actual noise gate, and the closest
+            # thing Gemini has to InterruptionOptions.min_duration.
+            prefix_padding_ms=int(_interruption_min_duration(settings) * 1000),
+            # Floored at 500ms on purpose. The 300ms default exists for Flux,
+            # which decides end-of-turn from the words themselves; Gemini's
+            # detector is a silence timer with no semantic component, so 300ms
+            # is just a caller drawing breath mid-sentence. Raising the
+            # dashboard value above the floor still works.
+            silence_duration_ms=int(max(500.0, settings.vad_threshold_ms)),
+        )
+    )
 
 
 def _build_stt(config: AgentConfig, provider: ProviderSettings) -> stt.STT:
@@ -190,6 +248,10 @@ def _turn_handling_from_settings(
 ) -> TurnHandlingOptions:
     """How the session decides a turn ended, and how eagerly it gets ahead.
 
+    Only reaches the STT/LLM/TTS pipeline -- a Gemini Live agent returns early,
+    because none of this is negotiable with a realtime model. Its equivalents
+    live in `_gemini_activity_detection`.
+
     Three deliberate choices here, all aimed at the delay a caller actually
     feels between finishing a sentence and hearing a reply:
 
@@ -207,17 +269,20 @@ def _turn_handling_from_settings(
     """
     settings = config.agent.conversation_settings
 
-    # interruption_sensitivity is 0..1 on the dashboard (higher = more sensitive);
-    # min_duration is seconds of speech needed to register as an interruption
-    # (lower = more sensitive). Linearly map across the SDK's own default range.
-    min_duration = 1.0 - settings.interruption_sensitivity * 0.8
+    if config.agent.llm_provider == "gemini_live":
+        # State what's actually true instead of passing options that get thrown
+        # away: a realtime model owns turn-taking outright (see
+        # _gemini_activity_detection), so endpointing, interruption and
+        # preemptive generation have nothing here to act on -- the SDK logs a
+        # warning and drops them. The equivalents are set on the model itself.
+        return TurnHandlingOptions(turn_detection="realtime_llm")
 
     options = TurnHandlingOptions(
         endpointing=EndpointingOptions(
             mode="dynamic",
             min_delay=settings.vad_threshold_ms / 1000.0,
         ),
-        interruption=InterruptionOptions(min_duration=max(0.1, min_duration)),
+        interruption=InterruptionOptions(min_duration=_interruption_min_duration(settings)),
         preemptive_generation=PreemptiveGenerationOptions(preemptive_tts=True),
     )
 

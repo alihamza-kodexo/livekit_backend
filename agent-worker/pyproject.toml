@@ -9,6 +9,10 @@ dependencies = [
     "livekit-plugins-silero",
     "livekit-plugins-groq",
     "livekit-plugins-google",  # Gemini Live -- opt-in realtime engine, see VOICE_STACK_DECISION.md
+    # Arrives with the plugin above anyway, but entrypoint.py imports it
+    # directly to build Gemini's activity-detection config, so it's a real
+    # first-order dependency rather than a transitive one.
+    "google-genai",
     "livekit-plugins-noise-cancellation",
     "supabase>=2.9",
     "httpx>=0.27",

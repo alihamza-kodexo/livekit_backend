@@ -63,6 +63,12 @@ class ProviderSettings:
     # lazy-optional pattern as DeepSeek above.
     gemini_api_key: str | None
     gemini_model: str
+    # Gemini's "proactive audio": the model judges for itself whether speech was
+    # addressed to it and stays quiet otherwise, so a background conversation
+    # stops pulling a reply out of it. Native-audio models only, and it forces
+    # the v1alpha endpoint -- off by default because a model that doesn't
+    # support it rejects the session outright rather than ignoring the flag.
+    gemini_proactive_audio: bool
 
     # --- Turn taking -------------------------------------------------------
     # Which Deepgram STT to run. "flux" uses Deepgram's Flux model, which
@@ -121,6 +127,8 @@ def provider_settings() -> ProviderSettings:
         deepseek_base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         gemini_api_key=os.environ.get("GEMINI_API_KEY") or None,
         gemini_model=os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-live-preview"),
+        gemini_proactive_audio=(os.environ.get("GEMINI_PROACTIVE_AUDIO") or "").strip().lower()
+        in ("1", "true", "yes"),
         stt_engine=(os.environ.get("DEEPGRAM_STT_ENGINE") or "flux").strip().lower(),
         deepgram_flux_model=os.environ.get("DEEPGRAM_FLUX_MODEL", "flux-general-en"),
         flux_eot_threshold=float(os.environ.get("DEEPGRAM_FLUX_EOT_THRESHOLD", "0.7")),

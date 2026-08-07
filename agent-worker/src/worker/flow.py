@@ -27,13 +27,17 @@ matter for compliance and correctness happen in code -- the LLM only decides
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterable
 
 from livekit.agents import Agent, ModelSettings
+from livekit.agents.llm import RealtimeModel
 
 from . import tools
 from .models import AgentConfig
 from .pronunciation import stt_keyterms, substitute_stream
+
+logger = logging.getLogger("worker.flow")
 
 
 def _build_instructions(config: AgentConfig) -> str:
@@ -83,7 +87,37 @@ class InboundCallAgent(Agent):
             # responds normally once the caller speaks first.
             return
 
+        realtime = isinstance(self.session.llm, RealtimeModel)
+
+        if realtime and not self.session.llm.capabilities.mutable_chat_context:
+            # Some Gemini Live models (anything 3.x so far) refuse a
+            # client-initiated first turn: the plugin gates generate_reply on
+            # mutable_chat_context and raises otherwise, so there is no way to
+            # make the agent speak first. Warn loudly rather than leaving an
+            # inbound call opening with silence and no explanation.
+            logger.warning(
+                "greeting skipped: %s doesn't support a client-initiated turn, so the agent "
+                "can't speak first. Use a native-audio Gemini Live model (e.g. "
+                "gemini-2.5-flash-native-audio-preview-12-2025), or set this agent's first "
+                "message to \"caller speaks first\".",
+                getattr(self.session.llm, "model", "this realtime model"),
+            )
+            return
+
         if self._first_message_mode == "agent_says_exact" and self._first_message_text:
+            if realtime:
+                # No TTS stage exists for say() to write into -- with a realtime
+                # model it raises outright (supports_say is False). The nearest
+                # equivalent is handing the model the exact line for this one
+                # turn; it's read by the model rather than synthesized verbatim,
+                # so treat it as strong instruction, not a guarantee.
+                self.session.generate_reply(
+                    instructions=(
+                        f"Open the call by saying exactly this, word for word, and nothing "
+                        f'else: "{self._first_message_text}"'
+                    )
+                )
+                return
             # session.say() goes straight to TTS, skipping the LLM entirely --
             # this is spoken verbatim, not ad-libbed from the prompt.
             self.session.say(self._first_message_text)
