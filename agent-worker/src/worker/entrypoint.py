@@ -234,21 +234,33 @@ def _gemini_activity_detection(
                 if sensitive
                 else genai_types.StartSensitivity.START_SENSITIVITY_LOW
             ),
-            # Stays LOW regardless: this end is about not cutting a caller off
-            # mid-pause, and being patient there costs a little latency rather
-            # than losing input entirely.
-            end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_LOW,
+            # HIGH, and deliberately not tied to the barge-in slider above.
+            #
+            # These two sensitivities do unrelated jobs and were wrongly set
+            # together. Start-of-speech is the noise gate: LOW there stops a
+            # television interrupting the agent. End-of-speech only decides how
+            # quickly the caller is judged to have finished -- it is pure reply
+            # latency, and LOW there buys nothing for noise.
+            #
+            # It was especially expensive on the phone. On a clean browser mic
+            # end-of-speech is crisp, so "be patient" costs almost nothing; on an
+            # 8kHz line carrying comfort noise and hiss the detector cannot
+            # cleanly separate noise from a caller still thinking, so patience
+            # became seconds. That was the whole browser-fast / phone-slow gap.
+            end_of_speech_sensitivity=genai_types.EndSensitivity.END_SENSITIVITY_HIGH,
             # How long speech must persist before it commits as start-of-activity
             # -- the noise gate, and the closest thing Gemini has to
             # InterruptionOptions.min_duration. Scaled so the default is a modest
             # 300ms instead of the 600ms that was swallowing real speech.
             prefix_padding_ms=int(round((1.0 - settings.interruption_sensitivity) * 500 + 50)),
-            # Floored at 500ms on purpose. The 300ms default exists for Flux,
-            # which decides end-of-turn from the words themselves; Gemini's
-            # detector is a silence timer with no semantic component, so 300ms
-            # is just a caller drawing breath mid-sentence. Raising the
-            # dashboard value above the floor still works.
-            silence_duration_ms=int(max(500.0, settings.vad_threshold_ms)),
+            # Floored at 400ms rather than 500: this is added to every single
+            # reply, and on a phone call it lands on top of PSTN transit and two
+            # jitter buffers that already cost half a second. A floor exists at
+            # all because Gemini's detector is a plain silence timer with no
+            # semantic component -- unlike Flux, which the 300ms dashboard
+            # default was chosen for -- so too low and it cuts off a caller
+            # drawing breath. Raising the dashboard value still works.
+            silence_duration_ms=int(max(400.0, settings.vad_threshold_ms)),
         )
     )
 
