@@ -75,13 +75,17 @@ def _build_session_kwargs(config: AgentConfig, provider: ProviderSettings, vad: 
                 f"agent {config.agent.agent_id} has llm_provider='gemini_live' but "
                 f"GEMINI_API_KEY isn't set on this worker."
             )
-        return {
-            "llm": google.realtime.RealtimeModel(
-                api_key=provider.gemini_api_key,
-                model=provider.gemini_model,
-                temperature=settings.temperature,
-            ),
+        realtime_kwargs: dict = {
+            "api_key": provider.gemini_api_key,
+            "model": provider.gemini_model,
+            "temperature": settings.temperature,
         }
+        # Gemini Live's own prebuilt voice set, picked per agent in the
+        # dashboard. Omitted entirely when unset so the plugin's default (Puck)
+        # applies rather than us hardcoding a second default here.
+        if config.agent.gemini_voice:
+            realtime_kwargs["voice"] = config.agent.gemini_voice
+        return {"llm": google.realtime.RealtimeModel(**realtime_kwargs)}
 
     if config.agent.llm_provider == "deepseek":
         if not provider.deepseek_api_key:

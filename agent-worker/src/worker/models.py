@@ -106,7 +106,13 @@ class Agent:
     stt_provider: str
     tts_provider: str
     llm_provider: LLMProvider
+    # Deepgram Aura TTS model name. Only reaches a call on the STT/LLM/TTS
+    # pipeline -- gemini_live has no separate TTS stage to apply it to.
     voice_id: str | None
+    # Gemini Live prebuilt voice name (Puck, Kore, Sulafat, ...). Separate column
+    # from voice_id because the two engines' voice namespaces don't overlap and
+    # an agent can be switched between them -- see the 0018 migration.
+    gemini_voice: str | None
     pronunciation_dictionary: list[PronunciationEntry]
     conversation_settings: ConversationSettings
     # Null means "use flow.py's default end-of-call guidance". Doesn't change what
@@ -140,6 +146,7 @@ class Agent:
             tts_provider=row.get("tts_provider") or "deepgram",
             llm_provider=row.get("llm_provider") or "groq",  # type: ignore[assignment]
             voice_id=row.get("voice_id"),
+            gemini_voice=row.get("gemini_voice"),
             pronunciation_dictionary=[
                 PronunciationEntry.from_row(r) for r in row.get("pronunciation_dictionary") or []
             ],
