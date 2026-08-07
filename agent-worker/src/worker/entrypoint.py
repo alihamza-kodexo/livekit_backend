@@ -127,6 +127,16 @@ def _build_session_kwargs(config: AgentConfig, provider: ProviderSettings, vad: 
             realtime_kwargs["voice"] = config.agent.gemini_voice
         if provider.gemini_proactive_audio:
             realtime_kwargs["proactivity"] = True
+        # Logged per call because "I changed the voice and it sounds the same" is
+        # otherwise unfalsifiable: the config is read fresh from Supabase on every
+        # job, so this line is the record of what was actually sent. Gemini
+        # validates the name and closes the session with 1007 if it doesn't know
+        # it, so a wrong value here fails loudly rather than silently defaulting.
+        logger.info(
+            "gemini live: model=%s voice=%s",
+            provider.gemini_model,
+            config.agent.gemini_voice or "<plugin default>",
+        )
         return {"llm": google.realtime.RealtimeModel(**realtime_kwargs)}
 
     if config.agent.llm_provider == "deepseek":
