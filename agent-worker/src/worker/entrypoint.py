@@ -8,6 +8,7 @@ with no n8n hop, per the decision to skip n8n for this build.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -30,7 +31,7 @@ from livekit.agents import (
     metrics,
     stt,
 )
-from livekit.plugins import deepgram, google, groq, noise_cancellation, openai, silero
+from livekit.plugins import deepgram, google, groq, openai, silero
 
 from . import deflection, notify
 from .flow import InboundCallAgent, stt_keyterm_list
@@ -40,6 +41,35 @@ from .state import CallState
 from .supabase_client import insert_call_log, load_agent_config_by_id, load_agent_config_by_number
 
 logger = logging.getLogger("worker.entrypoint")
+
+# Text-stream topic the dashboard's test panel listens on -- see
+# dashboard/app/(protected)/agents/[agentId]/test-panel.tsx. Keep the string
+# identical in both places; it's the only contract between them.
+DIAGNOSTIC_TOPIC = "kodexo.diagnostic"
+
+
+async def _report_diagnostic(ctx: JobContext, message: str) -> None:
+    """Push a failure reason into the room so the dashboard can show it.
+
+    Without this, every way a call can fail before the session starts -- a
+    missing provider key, a paused agent, a number with no agent behind it --
+    looks identical from the browser: a panel that says "Connecting" until the
+    tester gives up. The failure was only ever visible in the worker's own
+    stdout, which is on a different machine in production.
+
+    Best-effort by definition, since it runs on paths where something has
+    already gone wrong: it must never raise (that would mask the real error) and
+    never stall teardown. A SIP caller can't read text streams, so for phone
+    calls the log line is the record.
+    """
+    logger.error("call diagnostic: %s", message)
+    try:
+        await asyncio.wait_for(
+            ctx.room.local_participant.send_text(message, topic=DIAGNOSTIC_TOPIC),
+            timeout=2.0,
+        )
+    except Exception:  # noqa: BLE001 -- diagnostics must never mask the real failure
+        logger.debug("couldn't publish the diagnostic into the room", exc_info=True)
 
 
 def _test_agent_id_from_metadata(metadata: str) -> str | None:
@@ -236,6 +266,36 @@ def _build_stt(config: AgentConfig, provider: ProviderSettings) -> stt.STT:
     return stt.FallbackAdapter([flux, nova])
 
 
+def _room_input_options() -> RoomInputOptions:
+    """Attaches BVC noise cancellation only where it can actually run.
+
+    Enhanced noise cancellation is a LiveKit Cloud feature: the filter asks the
+    server to authorize it, and a self-hosted server has no such endpoint, so it
+    answers 404 and the plugin logs "noise cancellation unavailable" every few
+    seconds for the length of the call while doing nothing at all.
+
+    Worth knowing when chasing background noise on a self-hosted deployment:
+    there is no input-side suppression there whatsoever, so the only defences are
+    the model's own turn detector (see `_gemini_activity_detection`) and whatever
+    the caller's handset does.
+    """
+    if ".livekit.cloud" not in livekit_settings().url:
+        logger.info(
+            "self-hosted LiveKit (%s): skipping BVC noise cancellation, which is Cloud-only",
+            livekit_settings().url,
+        )
+        return RoomInputOptions()
+
+    # Imported here rather than at module scope on purpose: merely importing the
+    # plugin makes its native filter probe the server for authorization, which
+    # on a self-hosted deployment fails and logs a warning pair every few
+    # seconds for the whole call. Keeping the import inside the Cloud branch is
+    # what actually silences that, not just declining to pass the filter.
+    from livekit.plugins import noise_cancellation
+
+    return RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony())
+
+
 def prewarm(proc: JobProcess) -> None:
     """Loads the VAD model once per worker process rather than once per call --
     it's the same model regardless of which agent picks up, so there's nothing
@@ -303,22 +363,44 @@ def _log_turn_metrics(state: CallState, event: MetricsCollectedEvent) -> None:
     """
     metrics.log_metrics(event.metrics)
 
-    eou = getattr(event.metrics, "end_of_utterance_delay", None)
-    ttft = getattr(event.metrics, "ttft", None)
-    ttfb = getattr(event.metrics, "ttfb", None)
-    if eou is None and ttft is None and ttfb is None:
+    def timing(name: str) -> str | None:
+        """Negative means "not measured for this engine", not "instant" -- a
+        realtime model reports ttft=-1 on the turn that opens the session, and
+        never reports end_of_utterance_delay at all, since it never had a
+        separate endpointing step to measure. Printing -1.000 as if it were a
+        latency reading is worse than saying nothing."""
+        value = getattr(event.metrics, name, None)
+        if not isinstance(value, (int, float)) or value < 0:
+            return None
+        return f"{value:.3f}"
+
+    parts = {
+        "eou": timing("end_of_utterance_delay"),
+        "ttft": timing("ttft"),
+        "ttfb": timing("ttfb"),
+    }
+    if not any(parts.values()):
         return
 
     logger.info(
-        "turn timing transport=%s eou=%s ttft=%s ttfb=%s",
+        "turn timing transport=%s %s",
         "web" if state.is_test else "sip",
-        f"{eou:.3f}" if isinstance(eou, (int, float)) else "-",
-        f"{ttft:.3f}" if isinstance(ttft, (int, float)) else "-",
-        f"{ttfb:.3f}" if isinstance(ttfb, (int, float)) else "-",
+        " ".join(f"{key}={value}" for key, value in parts.items() if value),
     )
 
 
 async def entrypoint(ctx: JobContext) -> None:
+    """Reports why a call failed before re-raising, then lets the framework do
+    its normal teardown. Anything raised in here used to surface only in the
+    worker's log -- see `_report_diagnostic`."""
+    try:
+        await _run_call(ctx)
+    except Exception as exc:
+        await _report_diagnostic(ctx, f"{type(exc).__name__}: {exc}")
+        raise
+
+
+async def _run_call(ctx: JobContext) -> None:
     started_at = time.monotonic()
 
     test_agent_id = _test_agent_id_from_metadata(ctx.job.metadata)
@@ -326,42 +408,54 @@ async def entrypoint(ctx: JobContext) -> None:
     caller_number: str | None = None
 
     if test_agent_id:
-        config = await load_agent_config_by_id(test_agent_id)
-        if config is None:
-            logger.error("test dispatch for unknown agent_id=%s", test_agent_id)
-            ctx.delete_room()
-            return
+        # Waits for the tester *before* loading the config, not after: a
+        # diagnostic sent into an empty room is dropped, and "this agent no
+        # longer exists" is exactly what the panel needs to be able to show.
         # No kind filter -- the dashboard's test client joins as a standard
         # (non-SIP) participant. Testing a draft/paused agent is the whole
         # point of this path, so the production active-only gate below is
         # intentionally skipped for it.
         await ctx.wait_for_participant()
+        config = await load_agent_config_by_id(test_agent_id)
+        if config is None:
+            await _report_diagnostic(
+                ctx, f"No agent exists with id {test_agent_id}. It may have been deleted."
+            )
+            ctx.delete_room()
+            return
     else:
         participant = await ctx.wait_for_participant(kind=rtc.ParticipantKind.PARTICIPANT_KIND_SIP)
         dialed_number = participant.attributes.get("sip.trunkPhoneNumber")
         caller_number = participant.attributes.get("sip.phoneNumber")
         call_sid = participant.attributes.get("sip.twilio.callSid")
 
+        # A SIP caller can't receive a text stream, so on this branch
+        # _report_diagnostic is really just a uniform error log -- but it keeps
+        # every "why did that call drop" reason phrased the same way in one place.
         if not dialed_number:
-            logger.error(
-                "SIP participant %s has no sip.trunkPhoneNumber attribute; can't resolve an agent",
-                participant.identity,
+            await _report_diagnostic(
+                ctx,
+                f"SIP participant {participant.identity} has no sip.trunkPhoneNumber "
+                f"attribute, so no agent can be resolved. Check the LiveKit inbound "
+                f"trunk configuration.",
             )
             ctx.delete_room()
             return
 
         config = await load_agent_config_by_number(dialed_number)
         if config is None:
-            logger.error("no agent is assigned to dialed number %s", dialed_number)
+            await _report_diagnostic(
+                ctx, f"No agent is assigned to the dialed number {dialed_number}."
+            )
             ctx.delete_room()
             return
 
         if config.agent.status != "active":
-            logger.warning(
-                "agent %s for number %s is %s, not active; refusing the call",
-                config.agent.agent_id,
-                dialed_number,
-                config.agent.status,
+            await _report_diagnostic(
+                ctx,
+                f"Agent {config.agent.name} ({config.agent.agent_id}) is "
+                f"{config.agent.status}, not active, so the call to {dialed_number} "
+                f"was refused.",
             )
             ctx.delete_room()
             return
@@ -396,7 +490,7 @@ async def entrypoint(ctx: JobContext) -> None:
     await session.start(
         InboundCallAgent(config),
         room=ctx.room,
-        room_input_options=RoomInputOptions(noise_cancellation=noise_cancellation.BVCTelephony()),
+        room_input_options=_room_input_options(),
         # DTX off, RED on. DTX stops sending during silence, which is cheaper but
         # leaves the far side's adaptive jitter buffer without a steady stream to
         # converge on -- it then keeps a larger safety margin, and that margin is
@@ -491,6 +585,16 @@ def _render_transcript(session: AgentSession) -> str:
 
 def main() -> None:
     settings = livekit_settings()
+
+    # Reports zero load rather than just raising the ceiling: even 0.99 was
+    # crossed on a developer machine, and a refused dispatch is a lost call when
+    # there's no second worker to take it. See LiveKitSettings.load_threshold.
+    load_options: dict = (
+        {"load_fnc": lambda: 0.0}
+        if settings.load_threshold is None
+        else {"load_threshold": settings.load_threshold}
+    )
+
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
@@ -499,6 +603,7 @@ def main() -> None:
             ws_url=settings.url,
             api_key=settings.api_key,
             api_secret=settings.api_secret,
+            **load_options,
         )
     )
 

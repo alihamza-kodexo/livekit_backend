@@ -39,6 +39,24 @@ class LiveKitSettings:
     api_key: str
     api_secret: str
     agent_name: str
+    # CPU load above which the worker tells LiveKit it can't take jobs.
+    #
+    # None -- the default -- means "never refuse a call because the machine is
+    # busy", and it's the only defensible setting for a single worker: LiveKit's
+    # load shedding exists so a *pool* can route a call to a less busy peer, and
+    # with one worker there is no peer, so refusing simply loses the call.
+    #
+    # This is not theoretical. The framework's own production default is 0.7, and
+    # a box that also runs a dashboard and Docker crosses it constantly --
+    # measured on a dev machine here, load sat between 0.56 and 0.99. Every
+    # dispatch arriving above the line is dropped with no error raised anywhere:
+    # an inbound call just rings until the caller gives up, and the only trace is
+    # a single "marking as unavailable" line in the worker log. Two out of three
+    # test calls were lost this way at a 0.95 ceiling.
+    #
+    # Set WORKER_LOAD_THRESHOLD to a number below 1.0 to opt back into real load
+    # reporting once there is a pool to shed to.
+    load_threshold: float | None
 
 
 @dataclass(frozen=True)
@@ -113,7 +131,19 @@ def livekit_settings() -> LiveKitSettings:
         api_key=_required("LIVEKIT_API_KEY"),
         api_secret=_required("LIVEKIT_API_SECRET"),
         agent_name=os.environ.get("LIVEKIT_AGENT_NAME", "kodexo-inbound-agent"),
+        load_threshold=_load_threshold(),
     )
+
+
+def _load_threshold() -> float | None:
+    """None when load shedding is off -- see LiveKitSettings.load_threshold."""
+    raw = (os.environ.get("WORKER_LOAD_THRESHOLD") or "").strip().lower()
+    if raw in ("", "off", "none", "disabled", "0"):
+        return None
+    # Clamped rather than trusted: the framework refuses to start on >= 1.0
+    # outside dev mode, and a worker that won't boot is worse than one that
+    # quietly caps a typo'd ceiling.
+    return min(float(raw), 0.99)
 
 
 @lru_cache
