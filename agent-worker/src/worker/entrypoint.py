@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 
 from google.genai import types as genai_types
@@ -18,6 +19,7 @@ from livekit import rtc
 from livekit.agents import (
     AgentSession,
     EndpointingOptions,
+    ErrorEvent,
     InterruptionOptions,
     JobContext,
     JobProcess,
@@ -46,6 +48,69 @@ logger = logging.getLogger("worker.entrypoint")
 # dashboard/app/(protected)/agents/[agentId]/test-panel.tsx. Keep the string
 # identical in both places; it's the only contract between them.
 DIAGNOSTIC_TOPIC = "kodexo.diagnostic"
+
+
+def _watch_caller_audio(ctx: JobContext) -> None:
+    """Log how loud the caller actually is, once a second.
+
+    "The agent can't hear me" has been unanswerable from this side. The session
+    either produces a turn or it doesn't, and nothing in between distinguishes a
+    microphone publishing silence from a turn detector that won't trigger on
+    perfectly good speech -- they produce identical logs and identical silence.
+
+    This reads the same track the session consumes and reports its level, so
+    that question is settled by a number instead of inference. Levels to expect:
+    normal speech peaks around -20 dBFS, anything under about -60 is silence on
+    the wire.
+
+    Everything here is defensive on purpose. `room.on` handlers do not run on
+    this coroutine's event loop, so the task has to be handed back to it
+    explicitly -- calling `asyncio.create_task` straight from the callback binds
+    to whichever loop is current and raises "bound to a different event loop",
+    which killed the job outright. A meter that can drop a call is worse than no
+    meter, so it is also wrapped so nothing it does can propagate.
+    """
+    loop = asyncio.get_running_loop()
+
+    @ctx.room.on("track_subscribed")
+    def _on_track(
+        track: rtc.Track, publication: rtc.TrackPublication, participant: rtc.RemoteParticipant
+    ) -> None:
+        if track.kind != rtc.TrackKind.KIND_AUDIO:
+            return
+
+        async def meter() -> None:
+            peak = 0
+            frames = 0
+            async for event in rtc.AudioStream(track):  # noqa: PLR1702
+                # frame.data is a memoryview of int16 *samples*, not bytes --
+                # indexing it as bytes silently welds sample pairs into 32-bit
+                # garbage. Strided to keep this cheap enough to leave running.
+                window = event.frame.data[::16]
+                if len(window):
+                    loudest = max(max(window), -min(window))
+                    peak = max(peak, loudest)
+                frames += 1
+                if frames < 100:  # ~1s of 10ms frames
+                    continue
+                dbfs = 20 * math.log10(peak / 32767) if peak else -99.0
+                logger.info(
+                    "caller audio from %s: peak=%d/32767 (%.1f dBFS) %s",
+                    participant.identity,
+                    peak,
+                    dbfs,
+                    "SILENT -- nothing to respond to" if peak < 100 else "audible",
+                )
+                peak = 0
+                frames = 0
+
+        async def guarded() -> None:
+            try:
+                await meter()
+            except Exception:  # noqa: BLE001
+                logger.debug("caller audio meter stopped", exc_info=True)
+
+        asyncio.run_coroutine_threadsafe(guarded(), loop)
 
 
 async def _report_diagnostic(ctx: JobContext, message: str) -> None:
@@ -441,6 +506,11 @@ async def entrypoint(ctx: JobContext) -> None:
 async def _run_call(ctx: JobContext) -> None:
     started_at = time.monotonic()
 
+    # Registered before anyone joins so the very first frames are counted -- the
+    # question it answers ("did the caller's audio reach us at all") is worthless
+    # if the meter starts after the audio does.
+    _watch_caller_audio(ctx)
+
     test_agent_id = _test_agent_id_from_metadata(ctx.job.metadata)
     call_sid: str | None = None
     caller_number: str | None = None
@@ -519,6 +589,28 @@ async def _run_call(ctx: JobContext) -> None:
     @session.on("metrics_collected")
     def _on_metrics(event: MetricsCollectedEvent) -> None:
         _log_turn_metrics(state, event)
+
+    @session.on("error")
+    def _on_session_error(event: ErrorEvent) -> None:
+        """Tell the caller when the session breaks mid-call.
+
+        Until now these only ever reached the worker's stdout, so a realtime
+        session dying (Gemini answering 1011, a reply timing out) looked from
+        the browser exactly like an agent that had gone quiet -- the panel still
+        said "Listening" while nothing could possibly come back. Reporting it is
+        the difference between a visible fault and an apparently idle agent.
+        """
+        source = getattr(event.source, "model", None) or type(event.source).__name__
+        recoverable = getattr(event.error, "recoverable", None)
+        detail = str(getattr(event.error, "message", "") or event.error).strip()
+        suffix = (
+            " Retrying."
+            if recoverable
+            else " The agent can't recover from this -- end the call and start a new one."
+        )
+        asyncio.create_task(
+            _report_diagnostic(ctx, f"{source} error: {detail[:200] or 'unknown error'}.{suffix}")
+        )
 
     async def _on_shutdown() -> None:
         await _log_and_notify(state, session, started_at)

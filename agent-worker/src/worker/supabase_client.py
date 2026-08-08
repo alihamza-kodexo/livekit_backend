@@ -7,7 +7,9 @@ call needs rather than what an admin screen needs.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import weakref
 from typing import Any
 
 from supabase import AsyncClient, acreate_client
@@ -22,15 +24,36 @@ from .settings import supabase_settings
 
 logger = logging.getLogger("worker.supabase")
 
-_client: AsyncClient | None = None
+# Keyed by event loop, not a single module-level instance.
+#
+# The client owns an httpx connection pool, and httpx's HTTP/2 machinery binds
+# asyncio primitives (anyio Events, futures) to whichever loop first used the
+# connection. A worker process is reused across jobs and every job runs on its
+# own event loop, so a process-wide singleton hands job N+1 a pool bound to job
+# N's dead loop. The result is a bare
+#
+#     RuntimeError: <asyncio.locks.Event ...> is bound to a different event loop
+#
+# raised from the very first Supabase call in the job -- loading the agent
+# config -- so the agent never joins and the caller sits on "Connecting" with no
+# other symptom. It presents as random flakiness because it only bites when a
+# job lands on an already-used process.
+#
+# Weak keys so an entry disappears with its loop instead of accumulating one
+# dead client per job for the life of the process.
+_clients: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, AsyncClient] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 async def get_client() -> AsyncClient:
-    global _client
-    if _client is None:
+    loop = asyncio.get_running_loop()
+    client = _clients.get(loop)
+    if client is None:
         settings = supabase_settings()
-        _client = await acreate_client(settings.url, settings.service_role_key)
-    return _client
+        client = await acreate_client(settings.url, settings.service_role_key)
+        _clients[loop] = client
+    return client
 
 
 async def load_agent_config_by_number(dialed_number: str) -> AgentConfig | None:
