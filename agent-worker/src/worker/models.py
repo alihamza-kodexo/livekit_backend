@@ -11,12 +11,23 @@ from typing import Any, Literal
 AgentStatus = Literal["active", "paused", "draft"]
 
 # Switchable per-agent from the dashboard, no worker redeploy needed -- see
-# VOICE_STACK_DECISION.md. Groq is fast; DeepSeek is cheaper per-token but
-# slower. "gemini_live" is a different shape entirely: a speech-to-speech
-# realtime model that replaces the whole STT+LLM+TTS pipeline, not just the
-# LLM leg -- see entrypoint.py's session-building branch and the tradeoffs
-# documented in VOICE_STACK_DECISION.md before enabling it on a live agent.
-LLMProvider = Literal["groq", "deepseek", "gemini_live"]
+# VOICE_STACK_DECISION.md.
+#
+# The first three are text LLMs inside the same Deepgram STT+TTS pipeline, so
+# every turn-taking mechanism the worker has applies to all of them:
+#   "gemini"   -- Gemini Flash. The default and the fastest measured
+#                 time-to-first-token; see the 0019 migration for the numbers.
+#   "deepseek" -- cheaper per token, slower to first token. Its base URL is
+#                 configurable, which is the supported way to serve the same
+#                 open-weight model from a faster host.
+#   "groq"     -- kept for rollback; this account's key is currently rejected.
+#
+# "gemini_live" is a different shape entirely: a speech-to-speech realtime
+# model that replaces the whole STT+LLM+TTS pipeline, not just the LLM leg. It
+# also takes every turn-taking decision server-side, so Flux end-of-turn,
+# preemptive TTS and the endpointing settings do not apply to it -- see
+# entrypoint.py's session-building branch before enabling it on a live agent.
+LLMProvider = Literal["groq", "deepseek", "gemini", "gemini_live"]
 
 # How the agent opens a call -- see flow.py's on_enter.
 FirstMessageMode = Literal["agent_generates", "agent_says_exact", "user_starts"]

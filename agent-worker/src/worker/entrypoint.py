@@ -154,18 +154,24 @@ def _test_agent_id_from_metadata(metadata: str) -> str | None:
 
 
 def _build_session_kwargs(config: AgentConfig, provider: ProviderSettings, vad: silero.VAD) -> dict:
-    """The three conversation-engine options a dashboard admin can pick per
-    agent -- see VOICE_STACK_DECISION.md for the cost/latency reasoning
-    behind each.
+    """The conversation-engine options a dashboard admin can pick per agent --
+    see VOICE_STACK_DECISION.md for the cost/latency reasoning behind each.
 
-    Groq and DeepSeek are both plain text LLMs slotted into the same
-    Deepgram-STT / Deepgram-TTS pipeline (`vad`+`stt`+`llm`+`tts`). Gemini
-    Live is a different shape: a speech-to-speech realtime model that
+    Gemini, Groq and DeepSeek are all plain text LLMs slotted into the same
+    Deepgram-STT / Deepgram-TTS pipeline (`vad`+`stt`+`llm`+`tts`), so they
+    differ only in which model writes the words -- every turn-taking mechanism
+    in `_turn_handling_from_settings` applies identically to the three.
+
+    Gemini *Live* is a different shape: a speech-to-speech realtime model that
     replaces the *whole* pipeline, so it returns only `llm` -- no vad/stt/tts
     keys at all, and the framework handles audio in/out directly through it.
     That's also why Gemini Live gives up the pronunciation-dictionary
     substitution and most tuning knobs: there's no separate TTS step for
     `flow.py`'s `tts_node` override to hook into.
+
+    Worth keeping straight: "gemini" and "gemini_live" share an API key and
+    nothing else. They take different model names, and a name from one family
+    is rejected by the other's endpoint.
     """
 
     settings = config.agent.conversation_settings
@@ -204,24 +210,66 @@ def _build_session_kwargs(config: AgentConfig, provider: ProviderSettings, vad: 
         )
         return {"llm": google.realtime.RealtimeModel(**realtime_kwargs)}
 
-    if config.agent.llm_provider == "deepseek":
+    if config.agent.llm_provider == "gemini":
+        if not provider.gemini_api_key:
+            raise RuntimeError(
+                f"agent {config.agent.agent_id} has llm_provider='gemini' but "
+                f"GEMINI_API_KEY isn't set on this worker."
+            )
+        llm = google.LLM(
+            api_key=provider.gemini_api_key,
+            model=provider.gemini_llm_model,
+            temperature=settings.temperature,
+            # Reasoning before the first token is pure dead air on a phone
+            # call: nothing can be spoken until text arrives, so a model that
+            # thinks first simply makes the caller wait. Gemini 2.5 Flash
+            # reasons by default, which would give away the exact advantage it
+            # was chosen for.
+            #
+            # Budget 0 rather than a small budget -- this is a receptionist
+            # reading from a prompt and calling tools, not a task that benefits
+            # from deliberation. (Note the 3.x models take `thinking_level`
+            # instead and reject this field, which is why the default model here
+            # is pinned to a 2.x one.)
+            thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
+        )
+    elif config.agent.llm_provider == "deepseek":
         if not provider.deepseek_api_key:
             raise RuntimeError(
                 f"agent {config.agent.agent_id} has llm_provider='deepseek' but "
                 f"DEEPSEEK_API_KEY isn't set on this worker."
             )
-        llm = openai.LLM(
-            api_key=provider.deepseek_api_key,
-            base_url=provider.deepseek_base_url,
-            model=provider.deepseek_model,
-            temperature=settings.temperature,
-            # deepseek-v4-flash reasons by default (measured: 174 vs 39 total
-            # tokens for the same one-sentence answer). This kills the wasted
-            # reasoning-token cost, but does NOT fix DeepSeek's own API latency
-            # -- measured ~1.6s either way, still slow for live voice. See
-            # VOICE_STACK_DECISION.md.
-            extra_body={"thinking": {"type": "disabled"}},
-        )
+        llm_kwargs: dict = {
+            "api_key": provider.deepseek_api_key,
+            "base_url": provider.deepseek_base_url,
+            "model": provider.deepseek_model,
+            "temperature": settings.temperature,
+        }
+
+        # `thinking` is a parameter of DeepSeek's *own* API, not part of the
+        # OpenAI schema -- so it can only be sent to that host.
+        #
+        # It matters because DEEPSEEK_BASE_URL is the supported way to run the
+        # same open-weight model somewhere faster (DeepInfra, Together): the
+        # measured ~1.6s per reply is DeepSeek's origin infrastructure and
+        # network path, not the model thinking -- disabling reasoning only moved
+        # it 1.75s -> 1.58s. See VOICE_STACK_DECISION.md.
+        #
+        # Third-party hosts reject unknown body parameters with a 400 rather
+        # than ignoring them, which would fail every turn of every call. Sending
+        # this only to the origin API is what makes re-hosting a config change
+        # instead of a broken agent. Those hosts also serve the model with
+        # reasoning off by default, so nothing is lost by omitting it.
+        if "api.deepseek.com" in provider.deepseek_base_url:
+            llm_kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
+        else:
+            logger.info(
+                "deepseek: using non-origin host %s -- skipping the DeepSeek-only "
+                "`thinking` parameter",
+                provider.deepseek_base_url,
+            )
+
+        llm = openai.LLM(**llm_kwargs)
     else:
         if not provider.groq_api_key:
             raise RuntimeError(

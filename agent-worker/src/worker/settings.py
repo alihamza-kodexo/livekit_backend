@@ -77,10 +77,22 @@ class ProviderSettings:
     deepseek_api_key: str | None
     deepseek_model: str
     deepseek_base_url: str
-    # Only needed for agents with llm_provider='gemini_live' -- same
-    # lazy-optional pattern as DeepSeek above.
+    # Shared by both Gemini engines -- llm_provider='gemini' (Flash as a text
+    # LLM in the Deepgram pipeline) and llm_provider='gemini_live'
+    # (speech-to-speech). Same lazy-optional pattern as DeepSeek above.
     gemini_api_key: str | None
+    # The speech-to-speech model, for llm_provider='gemini_live' only.
     gemini_model: str
+    # The text model, for llm_provider='gemini' only. Separate setting because
+    # the two are different model families and an agent can be switched between
+    # them -- a live model name sent to the text API (or the reverse) is
+    # rejected outright.
+    #
+    # gemini-2.5-flash is the default on measured time-to-first-token for a
+    # one-sentence reply (451ms best / 499ms median, vs 535/648 for DeepSeek's
+    # origin API) -- see the 0019 migration for the full comparison. It's also
+    # the non-lite tier, which matters here because these agents call tools.
+    gemini_llm_model: str
     # Gemini's "proactive audio": the model judges for itself whether speech was
     # addressed to it and stays quiet otherwise, so a background conversation
     # stops pulling a reply out of it. Native-audio models only, and it forces
@@ -157,6 +169,7 @@ def provider_settings() -> ProviderSettings:
         deepseek_base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         gemini_api_key=os.environ.get("GEMINI_API_KEY") or None,
         gemini_model=os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-live-preview"),
+        gemini_llm_model=os.environ.get("GEMINI_LLM_MODEL", "gemini-2.5-flash"),
         gemini_proactive_audio=(os.environ.get("GEMINI_PROACTIVE_AUDIO") or "").strip().lower()
         in ("1", "true", "yes"),
         stt_engine=(os.environ.get("DEEPGRAM_STT_ENGINE") or "flux").strip().lower(),
