@@ -12,6 +12,7 @@ one, and only present at all if attached.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -99,6 +100,30 @@ def build_custom_tool(tool_row: Tool) -> RawFunctionTool:
     )
 
 
+def _as_transfer_uri(destination: str) -> str:
+    """LiveKit's SIP transfer takes a URI, not a phone number.
+
+    The dashboard asks an admin for a destination *number*, and E.164 is what
+    they sensibly type -- but `transfer_sip_participant` rejects a bare number
+    with `transfer_to must be a valid SIP(s) or TEL URI`, a 400 that surfaces
+    only at the moment a real caller asks to be transferred. Every transfer
+    failed this way: the caller heard the agent apologise and ask for a
+    callback number instead, which reads as the agent being broken rather than
+    as a configuration problem.
+
+    Anything already carrying a scheme is passed through untouched, so an admin
+    who deliberately enters a `sip:` address to reach an internal extension
+    still gets exactly what they typed.
+    """
+    value = destination.strip()
+    if value.lower().startswith(("tel:", "sip:", "sips:")):
+        return value
+    # Strip the separators people type in phone numbers; `tel:` wants digits
+    # (with an optional leading +), not "+1 (737) 271-0090".
+    compact = re.sub(r"[\s()\-.]", "", value)
+    return f"tel:{compact}"
+
+
 def build_transfer_call_tool(tool_row: Tool) -> RawFunctionTool:
     """A `tool_type: "transfer_call"` row -- SIP-transfers to the fixed
     number the admin set on this specific tool. One tool per destination
@@ -116,10 +141,14 @@ def build_transfer_call_tool(tool_row: Tool) -> RawFunctionTool:
         if participant is None:
             raise ToolError("No SIP participant found in the room to transfer.")
 
+        transfer_to = _as_transfer_uri(tool_row.destination_number)
         try:
-            await job_ctx.transfer_sip_participant(participant, tool_row.destination_number)
+            await job_ctx.transfer_sip_participant(participant, transfer_to)
         except Exception as e:
-            logger.exception("SIP transfer to %s failed", tool_row.destination_number)
+            # Logs the URI actually sent, not the row's raw value -- when a
+            # transfer is rejected, what went on the wire is the thing in
+            # question.
+            logger.exception("SIP transfer to %s failed", transfer_to)
             state.outcome = "transfer_failed"
             state.matched_department = tool_row.name
             raise ToolError(
