@@ -168,7 +168,15 @@ def provider_settings() -> ProviderSettings:
         deepseek_model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash"),
         deepseek_base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         gemini_api_key=os.environ.get("GEMINI_API_KEY") or None,
-        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-live-preview"),
+        # Native-audio 2.5, not 3.x. The 3.x live models cannot accept a
+        # client-initiated first turn, so an inbound agent on one of them never
+        # greets the caller -- and if GEMINI_PROACTIVE_AUDIO is also set, they
+        # reject the session outright and the call is silent end to end. Both
+        # failures look identical from the phone: nobody speaks, ever.
+        #
+        # Defaulting to a 3.x model made silence the out-of-the-box behaviour
+        # for the one thing this worker exists to do: answer inbound calls.
+        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-native-audio-latest"),
         gemini_llm_model=os.environ.get("GEMINI_LLM_MODEL", "gemini-2.5-flash"),
         gemini_proactive_audio=(os.environ.get("GEMINI_PROACTIVE_AUDIO") or "").strip().lower()
         in ("1", "true", "yes"),
