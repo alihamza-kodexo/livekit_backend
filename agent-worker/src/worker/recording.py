@@ -87,7 +87,15 @@ async def start(room_name: str) -> Recording | None:
     and this worker -- Cloudinary can deliver an MP3 transcode from the same
     asset if a browser needs one.
     """
-    settings = recording_settings()
+    try:
+        settings = recording_settings()
+    except Exception:
+        # Misconfigured storage must not cost a call. `main()` already refuses
+        # to boot the worker on this, so reaching here means the environment
+        # changed under a running process -- log it and take the call unrecorded.
+        logger.exception("recording is misconfigured; call proceeds unrecorded")
+        return None
+
     if not settings.enabled:
         return None
 

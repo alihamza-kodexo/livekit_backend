@@ -38,7 +38,7 @@ from livekit.plugins import deepgram, google, groq, openai, silero
 from . import deflection, notify, recording
 from .flow import InboundCallAgent, stt_keyterm_list
 from .models import AgentConfig, ConversationSettings
-from .settings import ProviderSettings, livekit_settings, provider_settings
+from .settings import ProviderSettings, livekit_settings, provider_settings, recording_settings
 from .state import CallState
 from .supabase_client import insert_call_log, load_agent_config_by_id, load_agent_config_by_number
 
@@ -660,11 +660,13 @@ async def _run_call(ctx: JobContext) -> None:
             _report_diagnostic(ctx, f"{source} error: {detail[:200] or 'unknown error'}.{suffix}")
         )
 
-    # Started before the session rather than after, so the agent's greeting is
-    # on the recording too instead of it opening on the caller's first reply.
-    # Returns None whenever recording is off or couldn't start -- see
-    # recording.py; nothing here treats that as a failure.
-    call_recording = await recording.start(ctx.room.name)
+    # Holds the recording handle so the shutdown callback below can be
+    # registered *before* recording starts. That order is the whole point: the
+    # first version started recording first, and a raised misconfiguration then
+    # took the call down with no callback registered -- so the call happened and
+    # nothing was written to call_logs at all. Losing the record of a call to a
+    # problem with storing its audio is far worse than losing the audio.
+    call_recording: recording.Recording | None = None
 
     async def _on_shutdown() -> None:
         # Finalised and uploaded before the row is written, not after, so
@@ -674,6 +676,12 @@ async def _run_call(ctx: JobContext) -> None:
         await _log_and_notify(state, session, started_at, recording_url)
 
     ctx.add_shutdown_callback(_on_shutdown)
+
+    # Started before the session rather than after, so the agent's greeting is
+    # on the recording too instead of it opening on the caller's first reply.
+    # Returns None whenever recording is off or couldn't start -- see
+    # recording.py; nothing here treats that as a failure.
+    call_recording = await recording.start(ctx.room.name)
 
     await session.start(
         InboundCallAgent(config),
@@ -779,6 +787,20 @@ def _render_transcript(session: AgentSession) -> str:
 
 def main() -> None:
     settings = livekit_settings()
+
+    # Validated here so a half-configured recording setup stops the worker from
+    # starting, rather than being discovered one call at a time. This is the only
+    # place it's safe to be strict about: refusing to boot is loud and happens
+    # before any caller is on the line, whereas the same check inside a call can
+    # only ever choose between dropping that call or recording nothing.
+    recording_config = recording_settings()
+    logger.info(
+        "call recording: %s",
+        f"on -> Cloudinary folder '{recording_config.cloudinary_folder}', "
+        f"staging in {recording_config.output_dir}"
+        if recording_config.enabled
+        else "off (set CALL_RECORDING_ENABLED=true to record)",
+    )
 
     # Reports zero load rather than just raising the ceiling: even 0.99 was
     # crossed on a developer machine, and a refused dispatch is a lost call when
