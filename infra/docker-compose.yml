@@ -69,6 +69,16 @@ services:
         logging:
           level: info
     volumes:
+      # This directory has to be writable by the *container's* user, which is
+      # not root. If it doesn't exist when the mount is set up, Docker creates it
+      # root-owned and mode 755, and every egress then completes while writing
+      # nothing -- with the file_results filename still reported, which makes it
+      # look like a mount problem instead of a permission one. Create it first:
+      #
+      #   mkdir -p infra/recordings
+      #   sudo chown $(docker exec infra-egress-1 id -u) infra/recordings
+      #
+      # The worker runs as root, so it can read and delete regardless of owner.
       - ./recordings:/out
     restart: unless-stopped
 

@@ -162,12 +162,27 @@ async def finish(recording: Recording | None) -> str | None:
         )
         return None
 
+    # Checked before the file, because a failed egress still reports the
+    # filename it was going to write. Blaming the bind mount for that sends
+    # whoever is debugging after a mount that was never wrong -- which is
+    # exactly what happened the first time this ran.
+    if info.status != egress_proto.EgressStatus.EGRESS_COMPLETE:
+        logger.error(
+            "egress %s ended as %s (error: %s) -- `docker logs` on the egress "
+            "container has the reason. A common one is that the container runs "
+            "as a non-root user and can't write to the output directory.",
+            recording.egress_id,
+            egress_proto.EgressStatus.Name(info.status),
+            info.error or "none reported",
+        )
+        return None
+
     path = _local_path(settings, info.file_results[0].filename)
     if not os.path.exists(path):
         logger.error(
-            "egress reported %s but this worker sees nothing at %s -- check that "
-            "RECORDING_OUTPUT_DIR and RECORDING_EGRESS_DIR are the two ends of "
-            "the same bind mount",
+            "egress reported %s complete but this worker sees nothing at %s -- "
+            "check that RECORDING_OUTPUT_DIR and RECORDING_EGRESS_DIR are the two "
+            "ends of the same bind mount (`docker inspect -f '{{json .Mounts}}'`)",
             info.file_results[0].filename,
             path,
         )
