@@ -26,3 +26,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Call recordings staged by the egress container before the worker uploads them
+# to Cloudinary and deletes them. Anything left here is customer call audio.
+infra/recordings/

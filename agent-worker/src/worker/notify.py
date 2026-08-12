@@ -89,11 +89,11 @@ async def send_end_call_webhook(
     even for dashboard test calls, matching how a custom tool call already
     isn't sandboxed there either -- see agent-worker's tools.py.
 
-    NOTE: recording_url is always None right now. There's no LiveKit Egress
-    (or any other) recording pipeline wired up in this build, so there's no
-    actual audio file to link -- the field is included so a receiving
-    workflow's shape doesn't need to change once recording exists, not
-    because it's populated today.
+    recording_url is a Cloudinary link when CALL_RECORDING_ENABLED is on and the
+    egress and upload both worked; None otherwise, which includes every call on a
+    deployment that leaves recording off. See recording.py. It's an
+    `authenticated` Cloudinary asset, so a receiving workflow can't fetch it with
+    the bare URL -- it needs a signed one.
     """
     if not agent.end_call_webhook_url:
         return

@@ -35,7 +35,7 @@ from livekit.agents import (
 )
 from livekit.plugins import deepgram, google, groq, openai, silero
 
-from . import deflection, notify
+from . import deflection, notify, recording
 from .flow import InboundCallAgent, stt_keyterm_list
 from .models import AgentConfig, ConversationSettings
 from .settings import ProviderSettings, livekit_settings, provider_settings
@@ -660,8 +660,18 @@ async def _run_call(ctx: JobContext) -> None:
             _report_diagnostic(ctx, f"{source} error: {detail[:200] or 'unknown error'}.{suffix}")
         )
 
+    # Started before the session rather than after, so the agent's greeting is
+    # on the recording too instead of it opening on the caller's first reply.
+    # Returns None whenever recording is off or couldn't start -- see
+    # recording.py; nothing here treats that as a failure.
+    call_recording = await recording.start(ctx.room.name)
+
     async def _on_shutdown() -> None:
-        await _log_and_notify(state, session, started_at)
+        # Finalised and uploaded before the row is written, not after, so
+        # call_logs.recording_url is populated on the first insert -- the
+        # dashboard reads that row once and doesn't poll for a link to appear.
+        recording_url = await recording.finish(call_recording)
+        await _log_and_notify(state, session, started_at, recording_url)
 
     ctx.add_shutdown_callback(_on_shutdown)
 
@@ -685,11 +695,17 @@ async def _run_call(ctx: JobContext) -> None:
     )
 
 
-async def _log_and_notify(state: CallState, session: AgentSession[CallState], started_at: float) -> None:
+async def _log_and_notify(
+    state: CallState,
+    session: AgentSession[CallState],
+    started_at: float,
+    recording_url: str | None = None,
+) -> None:
     duration_seconds = int(time.monotonic() - started_at)
     transcript = _render_transcript(session)
 
     await insert_call_log(
+        recording_url=recording_url,
         call_sid=state.call_sid,
         room_id=state.room_name,
         agent_id=state.config.agent.agent_id,
@@ -714,7 +730,7 @@ async def _log_and_notify(state: CallState, session: AgentSession[CallState], st
         room_id=state.room_name,
         caller_number=state.caller_number,
         transcript=transcript,
-        recording_url=None,
+        recording_url=recording_url,
         duration_seconds=duration_seconds,
         outcome=state.outcome,
         matched_department=state.matched_department,

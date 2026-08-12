@@ -120,6 +120,31 @@ class ProviderSettings:
 
 
 @dataclass(frozen=True)
+class RecordingSettings:
+    """Call recording -- LiveKit Egress writes a file, the worker uploads it to
+    Cloudinary. See recording.py for why it takes two hops.
+
+    Off unless CALL_RECORDING_ENABLED is set. That default is deliberate: these
+    are inbound PSTN calls, and recording them carries consent obligations that
+    depend on where the caller and the business are. Only the deployment's owner
+    can decide that, so the switch is theirs to throw -- along with adding
+    whatever disclosure their jurisdiction wants to the agent's greeting.
+    """
+
+    enabled: bool
+    # The shared directory, seen from each side of the egress container's bind
+    # mount: `output_dir` is this worker's path, `egress_dir` is the container's.
+    # They are the same directory. Both exist because Egress is told where to
+    # write in its own terms and the worker has to find the result in its own.
+    output_dir: str
+    egress_dir: str
+    cloudinary_cloud_name: str | None
+    cloudinary_api_key: str | None
+    cloudinary_api_secret: str | None
+    cloudinary_folder: str
+
+
+@dataclass(frozen=True)
 class SlackSettings:
     """Direct Slack incoming-webhook notifications -- there is no n8n hop in
     this build, per the project decision to skip n8n entirely. The worker
@@ -187,6 +212,43 @@ def provider_settings() -> ProviderSettings:
             os.environ.get("DEEPGRAM_FLUX_EAGER_EOT_THRESHOLD", "0.5")
         ),
         flux_eot_timeout_ms=int(os.environ.get("DEEPGRAM_FLUX_EOT_TIMEOUT_MS", "600")),
+    )
+
+
+@lru_cache
+def recording_settings() -> RecordingSettings:
+    """Refuses to enable itself half-configured.
+
+    Recording that silently doesn't happen is the worst outcome here -- the
+    dashboard shows a call with no audio and nothing says why, and by then the
+    call is over and unrepeatable. So a missing Cloudinary credential turns the
+    feature off loudly at the first call instead of recording into a void.
+    """
+    enabled = (os.environ.get("CALL_RECORDING_ENABLED") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME") or None
+    api_key = os.environ.get("CLOUDINARY_API_KEY") or None
+    api_secret = os.environ.get("CLOUDINARY_API_SECRET") or None
+
+    if enabled and not (cloud_name and api_key and api_secret):
+        raise RuntimeError(
+            "CALL_RECORDING_ENABLED is set but CLOUDINARY_CLOUD_NAME / "
+            "CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET are not all present, so "
+            "there would be nowhere to upload the recording to. Fill them in or "
+            "unset CALL_RECORDING_ENABLED."
+        )
+
+    return RecordingSettings(
+        enabled=enabled,
+        output_dir=os.environ.get("RECORDING_OUTPUT_DIR", "/opt/kodexo/recordings"),
+        egress_dir=os.environ.get("RECORDING_EGRESS_DIR", "/out"),
+        cloudinary_cloud_name=cloud_name,
+        cloudinary_api_key=api_key,
+        cloudinary_api_secret=api_secret,
+        cloudinary_folder=os.environ.get("CLOUDINARY_FOLDER", "kodexo-calls"),
     )
 
 

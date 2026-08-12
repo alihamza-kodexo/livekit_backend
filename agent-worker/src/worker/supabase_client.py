@@ -119,6 +119,10 @@ async def insert_call_log(
     agent_id: str | None,
     caller_number: str | None,
     transcript: str | None,
+    # None whenever recording is off, or on for a call whose egress or upload
+    # didn't work out -- see recording.py. The column has always been nullable
+    # and every row written before recording existed has it NULL.
+    recording_url: str | None,
     duration_seconds: int | None,
     outcome: CallOutcome | None,
     matched_department: str | None,
@@ -140,6 +144,7 @@ async def insert_call_log(
                 "agent_id": agent_id,
                 "caller_number": caller_number,
                 "transcript": transcript,
+                "recording_url": recording_url,
                 "duration_seconds": duration_seconds,
                 "outcome": outcome,
                 "matched_department": matched_department,
