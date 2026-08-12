@@ -35,7 +35,7 @@ from livekit.agents import (
 )
 from livekit.plugins import deepgram, google, groq, openai, silero
 
-from . import deflection, notify, recording
+from . import deflection, notify, recording, spam
 from .flow import InboundCallAgent, stt_keyterm_list
 from .models import AgentConfig, ConversationSettings
 from .settings import ProviderSettings, livekit_settings, provider_settings, recording_settings
@@ -672,6 +672,26 @@ async def _run_call(ctx: JobContext) -> None:
     def _on_metrics(event: MetricsCollectedEvent) -> None:
         _log_turn_metrics(state, event)
 
+    # Spam detection, if this agent has a detector attached and enabled. Set up
+    # before the session starts so the caller's very first reply is covered --
+    # that reply is the only one it looks at.
+    detectors = spam.detectors_for(config)
+    if detectors:
+        logger.info(
+            "spam detection active: %s",
+            ", ".join(f"{d.tool_name} ({len(d.statements)} statements)" for d in detectors),
+        )
+        if config.agent.llm_provider == "gemini_live":
+            # Worth saying out loud rather than letting an admin believe the
+            # agent is protected: detection reads STT transcripts, and a realtime
+            # agent has no separate STT stage to produce them.
+            logger.warning(
+                "agent %s is on gemini_live, where user_input_transcribed may never fire -- "
+                "spam detection may not run at all on this agent",
+                config.agent.agent_id,
+            )
+        spam.watch_first_reply(ctx, session, state, detectors, provider)
+
     @session.on("error")
     def _on_session_error(event: ErrorEvent) -> None:
         """Tell the caller when the session breaks mid-call.
@@ -763,6 +783,7 @@ async def _log_and_notify(
         duration_seconds=duration_seconds,
         outcome=state.outcome,
         matched_department=state.matched_department,
+        spam_detection=state.spam_detection,
         lead_name=state.lead_name,
         lead_company=state.lead_company,
         lead_need=state.lead_need,

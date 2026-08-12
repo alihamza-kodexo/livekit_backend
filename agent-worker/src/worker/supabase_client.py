@@ -126,6 +126,11 @@ async def insert_call_log(
     duration_seconds: int | None,
     outcome: CallOutcome | None,
     matched_department: str | None,
+    # Which spam detector ended the call and why -- see spam.py. Null on every
+    # call that wasn't dropped as spam. Paired with a spam_bot/spam_sales
+    # outcome, and the only trace of a hangup the caller was given no
+    # explanation for, so it's what a false positive is found from.
+    spam_detection: str | None = None,
     lead_name: str | None,
     lead_company: str | None,
     lead_need: str | None,
@@ -148,6 +153,7 @@ async def insert_call_log(
                 "duration_seconds": duration_seconds,
                 "outcome": outcome,
                 "matched_department": matched_department,
+                "spam_detection": spam_detection,
                 "lead_name": lead_name,
                 "lead_company": lead_company,
                 "lead_need": lead_need,

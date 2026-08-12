@@ -38,6 +38,12 @@ CallOutcome = Literal[
     "not_qualified",
     "transfer_failed",
     "dropped",
+    # Set by spam.py, not by the model. Kept separate from "dropped" -- which
+    # means "the agent judged this call not worth continuing", from any cause --
+    # because the whole point of detecting these is to be able to count them and
+    # review what was hung up on. See the 0020 migration.
+    "spam_bot",
+    "spam_sales",
 ]
 
 
@@ -172,7 +178,25 @@ class Agent:
         )
 
 
-ToolType = Literal["function", "transfer_call", "record_lead_info", "record_callback_number"]
+ToolType = Literal[
+    "function",
+    "transfer_call",
+    "record_lead_info",
+    "record_callback_number",
+    # The two detector types are the odd ones out: they are configuration rows,
+    # not callable functions. build_agent_tools deliberately doesn't build them,
+    # because handing the model a "hang up on spam" function would put the
+    # decision back where it can be argued with -- spam.py runs them against the
+    # first transcript instead. See the 0020 migration.
+    "detect_bot_call",
+    "detect_sales_call",
+]
+
+# Which detector types exist, and the CallOutcome each one writes when it fires.
+DETECTOR_TOOL_TYPES: dict[str, CallOutcome] = {
+    "detect_bot_call": "spam_bot",
+    "detect_sales_call": "spam_sales",
+}
 
 
 @dataclass(frozen=True)
@@ -198,9 +222,31 @@ class Tool:
     webhook_url: str | None
     destination_number: str | None
     is_builtin: bool
+    # Off switches the tool off for every agent at once, without unpicking
+    # agent_tools row by row. Applies to all types, not just detectors.
+    is_enabled: bool
+    # Detector types only. Example statements an admin maintains: matched
+    # literally first (free, no LLM) and then used as few-shot examples for the
+    # semantic pass -- see spam.py.
+    detector_statements: list[str]
+    # Which LLM judges the semantic pass. None means "use the agent's own
+    # llm_provider", which is the sane default: one fewer thing to configure,
+    # and the key is already known to be present.
+    detector_llm: str | None
 
     @staticmethod
     def from_row(row: dict[str, Any]) -> "Tool":
+        # Statements are jsonb, so a hand-edited row can contain anything --
+        # coerced to strings and stripped of blanks here rather than letting an
+        # empty entry match every utterance, which is what a bare "" would do to
+        # the containment check in spam.literal_match.
+        raw_statements = row.get("detector_statements") or []
+        statements = [
+            text.strip()
+            for text in (str(value) for value in raw_statements if value is not None)
+            if text.strip()
+        ]
+
         return Tool(
             tool_id=row["tool_id"],
             name=row["name"],
@@ -210,6 +256,10 @@ class Tool:
             webhook_url=row.get("webhook_url"),
             destination_number=row.get("destination_number"),
             is_builtin=bool(row.get("is_builtin")),
+            # Defaults to enabled for a row written before the column existed.
+            is_enabled=bool(row.get("is_enabled", True)),
+            detector_statements=statements,
+            detector_llm=row.get("detector_llm"),
         )
 
 

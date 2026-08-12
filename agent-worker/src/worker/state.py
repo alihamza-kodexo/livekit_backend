@@ -37,6 +37,12 @@ class CallState:
     matched_department: str | None = None
     transfer_failed_callback_number: str | None = None
 
+    # Which spam detector fired and why (see spam.py). Set alongside a
+    # spam_bot/spam_sales outcome, and worth more than the outcome alone: those
+    # calls are hung up on with no explanation to the caller, so this is the only
+    # evidence available when deciding whether a statement list is too broad.
+    spam_detection: str | None = None
+
     # Rotates through the "are you AI?" deflection lines (FSD Section 4.5-ish
     # human-likeness requirement) so no line repeats within a single call.
     ai_deflection_index: int = 0

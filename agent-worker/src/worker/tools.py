@@ -20,7 +20,7 @@ from livekit import rtc
 from livekit.agents import RunContext, get_job_context
 from livekit.agents.llm import RawFunctionTool, ToolError, function_tool
 
-from .models import Agent, Tool
+from .models import DETECTOR_TOOL_TYPES, Agent, Tool
 from .state import CallState
 
 logger = logging.getLogger("worker.tools")
@@ -252,11 +252,26 @@ _TOOL_BUILDERS = {
 
 
 def build_agent_tools(tool_rows: list[Tool]) -> list:
-    """Every attached tool, regardless of type -- dispatches on `tool_type`
-    to the matching builder above."""
+    """Every attached, enabled tool -- dispatches on `tool_type` to the matching
+    builder above.
+
+    Two kinds of row produce nothing here, and neither is an error:
+
+    - Anything switched off (`is_enabled` false). One flag turns a tool off for
+      every agent at once, which is otherwise a matter of unpicking `agent_tools`
+      row by row.
+    - The `detect_*` types, which are configuration for spam.py rather than
+      functions. Handing the model a "hang up on spam" tool would put that
+      decision back somewhere a caller can talk it out of -- see spam.py.
+    """
 
     tools = []
     for row in tool_rows:
+        if not row.is_enabled:
+            logger.info("tool %s is switched off; not offering it to the model", row.name)
+            continue
+        if row.tool_type in DETECTOR_TOOL_TYPES:
+            continue
         builder = _TOOL_BUILDERS.get(row.tool_type)
         if builder is None:
             logger.error("unknown tool_type %r for tool row %s", row.tool_type, row.tool_id)
