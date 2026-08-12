@@ -113,6 +113,40 @@ def _watch_caller_audio(ctx: JobContext) -> None:
         asyncio.run_coroutine_threadsafe(guarded(), loop)
 
 
+def _end_job_when_caller_leaves(ctx: JobContext, identity: str) -> None:
+    """Shut the job down as soon as the caller hangs up.
+
+    `close_on_disconnect` already closes the *session* when the caller leaves,
+    which is why the agent stops responding -- but closing the session does not
+    end the job, leave the room, or stop the egress. And a room composite
+    records the room, not the conversation. So without this the agent sits alone
+    in the room until LiveKit's own room timeout expires, the recording collects
+    every one of those minutes as silence, and `recording_url` reaches Supabase
+    just as late, because `finish()` can't run until the shutdown callback does.
+
+    The wasted bytes are the least of it: egress keeps a headless Chrome
+    compositing that silence for the whole interval, so on a small box the next
+    call is contending with the previous call's teardown -- which makes
+    back-to-back test calls measure the tail of each other rather than
+    themselves.
+
+    Same event-loop hazard as `_watch_caller_audio` above: `room.on` handlers do
+    not run on the job's loop, so the shutdown is handed back to it rather than
+    called straight from the callback.
+    """
+    loop = asyncio.get_running_loop()
+
+    @ctx.room.on("participant_disconnected")
+    def _on_disconnected(participant: rtc.RemoteParticipant) -> None:
+        # Identity rather than kind: this is the participant the call was
+        # waiting on, so it's the right one to end on for a SIP caller and for
+        # the dashboard's tester alike.
+        if participant.identity != identity:
+            return
+        logger.info("%s disconnected; ending the job so the recording stops here", identity)
+        loop.call_soon_threadsafe(ctx.shutdown, "caller hung up")
+
+
 async def _report_diagnostic(ctx: JobContext, message: str) -> None:
     """Push a failure reason into the room so the dashboard can show it.
 
@@ -571,7 +605,7 @@ async def _run_call(ctx: JobContext) -> None:
         # (non-SIP) participant. Testing a draft/paused agent is the whole
         # point of this path, so the production active-only gate below is
         # intentionally skipped for it.
-        await ctx.wait_for_participant()
+        participant = await ctx.wait_for_participant()
         config = await load_agent_config_by_id(test_agent_id)
         if config is None:
             await _report_diagnostic(
@@ -682,6 +716,13 @@ async def _run_call(ctx: JobContext) -> None:
     # Returns None whenever recording is off or couldn't start -- see
     # recording.py; nothing here treats that as a failure.
     call_recording = await recording.start(ctx.room.name)
+
+    # After `recording.start`, not before: this handler can fire the shutdown
+    # callback, and that callback reads `call_recording`. Registering it earlier
+    # means a caller who hangs up during startup gets a teardown that sees None
+    # and leaves the egress running to the room timeout -- the exact thing this
+    # is here to prevent.
+    _end_job_when_caller_leaves(ctx, participant.identity)
 
     await session.start(
         InboundCallAgent(config),

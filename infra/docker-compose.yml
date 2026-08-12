@@ -23,6 +23,18 @@ services:
           port_range_start: 50000
           port_range_end: 60000
           use_external_ip: true
+        # Both default to minutes, which is far too long for a phone call: the
+        # worker ends its own job when the caller hangs up (see
+        # entrypoint.py::_end_job_when_caller_leaves), but if that job dies
+        # without running its shutdown callback, the room is what finally stops
+        # a still-running egress -- and until it does, that egress records
+        # silence and keeps a headless Chrome busy compositing it.
+        #
+        # departure_timeout applies once someone has joined and left, which is
+        # every real call; empty_timeout covers a room nobody ever reached.
+        room:
+          empty_timeout: 60
+          departure_timeout: 15
         redis:
           address: localhost:6379
           password: ${REDIS_PASSWORD}
