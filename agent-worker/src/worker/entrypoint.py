@@ -12,11 +12,13 @@ import asyncio
 import json
 import logging
 import math
+import os
 import time
 
 from google.genai import types as genai_types
 from livekit import rtc
 from livekit.agents import (
+    AgentFalseInterruptionEvent,
     AgentSession,
     EndpointingOptions,
     ErrorEvent,
@@ -24,7 +26,6 @@ from livekit.agents import (
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
-    PreemptiveGenerationOptions,
     RoomInputOptions,
     RoomOutputOptions,
     TurnHandlingOptions,
@@ -49,6 +50,28 @@ logger = logging.getLogger("worker.entrypoint")
 # identical in both places; it's the only contract between them.
 DIAGNOSTIC_TOPIC = "kodexo.diagnostic"
 
+# Ceiling on how long the session will wait for the caller to be finished, when
+# Flux's end-of-turn confidence stays low. Not a dashboard setting -- the floor
+# is ("silence before replying"), and an admin has no way to judge this one. See
+# `_turn_handling_from_settings` for why it has to be stated rather than left to
+# the SDK's 3.0s.
+_ENDPOINTING_MAX_DELAY = 1.5
+
+# How many recognized words a caller has to produce before the agent stops
+# talking. Zero -- the SDK default -- means raw VAD energy is enough, which on a
+# phone line without noise cancellation is whatever the room is doing. Two is
+# deliberately above one: single-word barge-in is the case most easily faked by
+# an echo of the agent's own speech. See `_turn_handling_from_settings`.
+_INTERRUPTION_MIN_WORDS = 2
+
+# The caller-loudness meter is a debugging tool, not something every production
+# call should pay for -- see `_watch_caller_audio`.
+_AUDIO_METER_ENABLED = (os.environ.get("CALLER_AUDIO_METER") or "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 
 def _watch_caller_audio(ctx: JobContext) -> None:
     """Log how loud the caller actually is, once a second.
@@ -63,6 +86,14 @@ def _watch_caller_audio(ctx: JobContext) -> None:
     normal speech peaks around -20 dBFS, anything under about -60 is silence on
     the wire.
 
+    Off unless CALLER_AUDIO_METER is set, because it is not free and it ran on
+    every production call: it opens a *second* subscription to the caller's
+    track alongside the one the session consumes, does per-frame work on the
+    job's event loop a hundred times a second, and writes a log line every
+    second for the length of the call. That is a poor trade on a box whose event
+    loop also has to pump TTS frames out on time. Switch it on for the call
+    you're debugging and leave it off the rest of the time.
+
     Everything here is defensive on purpose. `room.on` handlers do not run on
     this coroutine's event loop, so the task has to be handed back to it
     explicitly -- calling `asyncio.create_task` straight from the callback binds
@@ -70,6 +101,9 @@ def _watch_caller_audio(ctx: JobContext) -> None:
     which killed the job outright. A meter that can drop a call is worse than no
     meter, so it is also wrapped so nothing it does can propagate.
     """
+    if not _AUDIO_METER_ENABLED:
+        return
+
     loop = asyncio.get_running_loop()
 
     @ctx.room.on("track_subscribed")
@@ -428,9 +462,22 @@ def _build_stt(config: AgentConfig, provider: ProviderSettings) -> stt.STT:
     and still emits END_OF_SPEECH, so turn-taking keeps working -- just without
     the model-based decision. Set DEEPGRAM_STT_ENGINE=nova to skip Flux
     entirely.
+
+    Which is why nova is given real endpointing here rather than left on the
+    plugin's defaults. `turn_detection="stt"` stays set across a fallback (see
+    `_turn_handling_from_settings`), so after a switchover nova's END_OF_SPEECH
+    *is* the turn decision -- and its default `endpointing_ms` is 25, meaning 25
+    milliseconds of silence ends the caller's turn. The agent then talks over
+    anyone who pauses for breath. Matching the dashboard's own "silence before
+    replying" makes the degraded path merely worse than Flux instead of unusable,
+    and `utterance_end_ms` gives it the UtteranceEnd signal the plugin otherwise
+    leaves switched off.
     """
+    settings = config.agent.conversation_settings
     nova = deepgram.STT(
         api_key=provider.deepgram_api_key,
+        endpointing_ms=int(settings.vad_threshold_ms),
+        utterance_end_ms=1000,
         # NOT `or None` -- deepgram.STT does `list(keyterm)` unconditionally
         # when it isn't a str, which crashes on None. An empty list (no
         # pronunciation dictionary entries) is the correct "no boosting" value.
@@ -449,6 +496,31 @@ def _build_stt(config: AgentConfig, provider: ProviderSettings) -> stt.STT:
         keyterm=stt_keyterm_list(config),
     )
     return stt.FallbackAdapter([flux, nova])
+
+
+def _watch_stt_fallback(recognizer: stt.STT | None) -> None:
+    """Say it out loud when Flux drops and nova-3 takes the call over.
+
+    A FallbackAdapter switchover is completely silent from the outside, and it
+    changes how the agent behaves: Flux decides end-of-turn from the speech,
+    nova decides it from a silence timer. A call that starts responsive and turns
+    twitchy halfway through is this, and without a log line there is nothing to
+    tell it apart from the network being slow.
+
+    No-op unless Flux is actually in front (`DEEPGRAM_STT_ENGINE=nova` returns a
+    bare STT with no such event) -- see `_build_stt`.
+    """
+    if not isinstance(recognizer, stt.FallbackAdapter):
+        return
+
+    @recognizer.on("stt_availability_changed")
+    def _on_availability(event: stt.AvailabilityChangedEvent) -> None:
+        logger.warning(
+            "STT %s is now %s -- turn-taking for the rest of this call is whichever "
+            "engine is still up (see _build_stt)",
+            event.stt.label,
+            "available again" if event.available else "UNAVAILABLE",
+        )
 
 
 def _room_input_options() -> RoomInputOptions:
@@ -497,20 +569,48 @@ def _turn_handling_from_settings(
     because none of this is negotiable with a realtime model. Its equivalents
     live in `_gemini_activity_detection`.
 
-    Three deliberate choices here, all aimed at the delay a caller actually
-    feels between finishing a sentence and hearing a reply:
+    Four deliberate choices here, all aimed at the delay a caller actually
+    feels between finishing a sentence and hearing a reply, and at the agent
+    being stopped mid-reply by something that wasn't the caller:
 
     - `turn_detection="stt"` when Flux is in use. Without it the session
       auto-selects VAD (it prefers VAD whenever a VAD model is passed, which it
       always is here for interruption detection), and Flux's end-of-turn signal
       would be ignored entirely.
-    - `mode="dynamic"` endpointing shortens the wait when the utterance already
-      sounds finished, instead of always spending the full delay.
-    - `preemptive_tts` puts the *audio* generation in front of turn
-      confirmation too. LLM preemption is already on by default in this SDK;
-      this is the remaining half. It costs the occasional discarded synthesis
-      when a caller resumes talking, in exchange for first-audio arriving
-      sooner on the turns where they don't.
+    - `mode="fixed"` endpointing, *not* dynamic. This reads backwards, so it is
+      worth being explicit: `DynamicEndpointing` does not shorten the wait when
+      an utterance sounds finished. It runs an exponential filter that learns
+      the delay **upward** from the caller's pauses and from immediate
+      interruptions, with `min_delay` as nothing but the floor -- and whatever
+      it learns is then awaited flat on top of Flux's end-of-turn on every
+      single turn. On a phone line that produced a call which got progressively
+      slower the longer it ran, because every false barge-in fed the filter.
+      Flux already makes the semantic decision; the dashboard's "silence before
+      replying" belongs under it as a fixed floor.
+    - `max_delay` set explicitly. Left unset it is 3.0s, not the 2.5s the SDK
+      documents for streaming turn detectors: the tighter defaults are selected
+      by an `isinstance` check against a detector *object*, and the string
+      "stt" doesn't match it. 1.5s is the real ceiling we want behind Flux.
+    - `min_words` on interruptions. Barge-in here is plain VAD energy: the SDK's
+      adaptive interruption detector is off by default outside dev/Cloud, and
+      `_room_input_options` can't attach BVC on a self-hosted server, so there
+      is no input-side suppression whatsoever. That left 0.6s of *any* audio
+      above Silero's threshold -- line hiss, a television, the agent's own voice
+      echoing back off a speakerphone -- pausing the agent mid-reply, which then
+      resumed two seconds later once the SDK judged the interruption false. Two
+      seconds of silence dropped into the middle of a sentence is exactly what
+      that sounds like from the caller's end. Requiring the "speech" to have
+      produced words routes barge-in through the transcript instead, where noise
+      produces nothing. The cost is that a one-word interjection no longer cuts
+      the agent off.
+
+    `preemptive_tts` is deliberately *not* enabled. It puts audio generation in
+    front of turn confirmation (LLM preemption is already on by default), which
+    is a good trade on an idle box and a bad one here: with Flux's eager
+    end-of-turn firing often and `max_retries` at 3, a turn can run three
+    speculative LLM+TTS generations and throw away two, on a two-core VPS that
+    is already sharing those cores with the SFU, the SIP bridge and the egress
+    recorder. Worth revisiting once the worker has a box to itself.
     """
     settings = config.agent.conversation_settings
 
@@ -524,11 +624,14 @@ def _turn_handling_from_settings(
 
     options = TurnHandlingOptions(
         endpointing=EndpointingOptions(
-            mode="dynamic",
+            mode="fixed",
             min_delay=settings.vad_threshold_ms / 1000.0,
+            max_delay=_ENDPOINTING_MAX_DELAY,
         ),
-        interruption=InterruptionOptions(min_duration=_interruption_min_duration(settings)),
-        preemptive_generation=PreemptiveGenerationOptions(preemptive_tts=True),
+        interruption=InterruptionOptions(
+            min_duration=_interruption_min_duration(settings),
+            min_words=_INTERRUPTION_MIN_WORDS,
+        ),
     )
 
     if provider.stt_engine == "flux":
@@ -537,7 +640,27 @@ def _turn_handling_from_settings(
     return options
 
 
-def _log_turn_metrics(state: CallState, event: MetricsCollectedEvent) -> None:
+def _active_endpointing_delay(session: AgentSession) -> float | None:
+    """The endpointing delay the session is *actually* waiting, right now.
+
+    Not the same thing as the configured floor, which is the only value anyone
+    can read off the dashboard. `eou` in the turn log is the total end-of-turn
+    delay; this separates out how much of it the session chose to sit on, so a
+    slow turn can be attributed to Flux, to the LLM, or to endpointing without
+    guessing between them.
+
+    Reaches through three private attributes to get it, which is why it is
+    wrapped: there is no public accessor, and a logging helper has no business
+    being able to fail a call if the SDK moves them.
+    """
+    try:
+        recognition = session._activity._audio_recognition  # noqa: SLF001
+        return float(recognition._endpointing.min_delay)  # noqa: SLF001
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _log_turn_metrics(state: CallState, session: AgentSession, event: MetricsCollectedEvent) -> None:
     """Per-turn timings, so "the phone feels slower than the browser" can be
     answered with numbers instead of inference.
 
@@ -567,6 +690,13 @@ def _log_turn_metrics(state: CallState, event: MetricsCollectedEvent) -> None:
     if not any(parts.values()):
         return
 
+    # Appended rather than folded into `parts`, which only holds values read off
+    # the metrics event -- this one is session state and is present on every
+    # turn, including the ones where nothing else was measured.
+    endpointing = _active_endpointing_delay(session)
+    if endpointing is not None:
+        parts["endpointing"] = f"{endpointing:.3f}"
+
     logger.info(
         "turn timing transport=%s %s",
         "web" if state.is_test else "sip",
@@ -590,7 +720,8 @@ async def _run_call(ctx: JobContext) -> None:
 
     # Registered before anyone joins so the very first frames are counted -- the
     # question it answers ("did the caller's audio reach us at all") is worthless
-    # if the meter starts after the audio does.
+    # if the meter starts after the audio does. Returns immediately unless
+    # CALLER_AUDIO_METER is set.
     _watch_caller_audio(ctx)
 
     test_agent_id = _test_agent_id_from_metadata(ctx.job.metadata)
@@ -662,15 +793,36 @@ async def _run_call(ctx: JobContext) -> None:
     provider = provider_settings()
     vad = ctx.proc.userdata.get("vad") or silero.VAD.load()
 
+    session_kwargs = _build_session_kwargs(config, provider, vad)
+    _watch_stt_fallback(session_kwargs.get("stt"))
+
     session: AgentSession[CallState] = AgentSession(
         userdata=state,
         turn_handling=_turn_handling_from_settings(config, provider),
-        **_build_session_kwargs(config, provider, vad),
+        **session_kwargs,
     )
 
     @session.on("metrics_collected")
     def _on_metrics(event: MetricsCollectedEvent) -> None:
-        _log_turn_metrics(state, event)
+        _log_turn_metrics(state, session, event)
+
+    @session.on("agent_false_interruption")
+    def _on_false_interruption(event: AgentFalseInterruptionEvent) -> None:
+        """The agent was stopped mid-reply by something that turned out not to
+        be the caller.
+
+        Silent until now, which made the loudest complaint about these agents --
+        "it keeps cutting itself off" -- impossible to confirm from a log. Each
+        one of these lines is a reply that was interrupted by noise and then, if
+        `resumed`, restarted about two seconds later, leaving a hole in the
+        middle of a sentence. See `_turn_handling_from_settings` for what now
+        gates barge-in; a run of these means the gate isn't tight enough.
+        """
+        logger.warning(
+            "agent falsely interrupted (resumed=%s) -- something that wasn't speech "
+            "stopped the reply",
+            event.resumed,
+        )
 
     # Spam detection, if this agent has a detector attached and enabled. Set up
     # before the session starts so the caller's very first reply is covered --
