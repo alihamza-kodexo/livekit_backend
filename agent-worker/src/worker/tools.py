@@ -38,7 +38,25 @@ _END_CALL_DESCRIPTION = (
 )
 
 
-async def _hang_up(context: RunContext[CallState], outcome: str | None = None) -> str:
+async def _hang_up(context: RunContext[CallState], outcome: str | None = None) -> None:
+    """Returns None, and that is the whole point rather than an oversight.
+
+    The SDK decides whether to run another LLM turn after a tool from whether
+    that tool returned anything: `reply_required=fnc_out is not None` in
+    voice/generation.py. Returning a string -- this used to return "Call ending."
+    -- therefore asked the model to comment on the result *after* the room had
+    already been deleted underneath it. Gemini, called against a session being
+    torn down, answers with an empty completion:
+
+        APIStatusError('no response generated', body='finish reason: STOP')
+
+    which surfaces as an llm_error and gets narrated to the caller as "there was
+    an issue ending the call" -- immediately after the goodbye, on a call that
+    hung up perfectly well. A race, so it didn't fail every time.
+
+    There is nothing to tell the model here anyway: the call is over, and any
+    reply it produced would be spoken into a room that no longer exists.
+    """
     state = context.userdata
     if outcome and state.outcome is None:
         state.outcome = outcome  # type: ignore[assignment]
@@ -48,12 +66,11 @@ async def _hang_up(context: RunContext[CallState], outcome: str | None = None) -
 
     job_ctx = get_job_context()
     job_ctx.delete_room()
-    return "Call ending."
 
 
 @function_tool(name="end_call", description=_END_CALL_DESCRIPTION)
-async def end_call(context: RunContext[CallState], outcome: str | None = None) -> str:
-    return await _hang_up(context, outcome)
+async def end_call(context: RunContext[CallState], outcome: str | None = None) -> None:
+    await _hang_up(context, outcome)
 
 
 def build_end_call_tool(tool_row: Tool) -> RawFunctionTool:
@@ -75,8 +92,8 @@ def build_end_call_tool(tool_row: Tool) -> RawFunctionTool:
     produces calls cut off mid-sentence.
     """
 
-    async def _end(raw_arguments: dict[str, Any], context: RunContext[CallState]) -> str:
-        return await _hang_up(context, raw_arguments.get("outcome"))
+    async def _end(raw_arguments: dict[str, Any], context: RunContext[CallState]) -> None:
+        await _hang_up(context, raw_arguments.get("outcome"))
 
     _end.__name__ = tool_row.name
 
