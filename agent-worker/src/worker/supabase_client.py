@@ -156,6 +156,12 @@ async def insert_call_log(
     call_summary: str | None = None,
     user_queries: list[str] | None = None,
     priority: str | None = None,
+    # The caller's name as the analysis model heard it -- a separate column from
+    # lead_name, which the record_lead_info tool fills deliberately during the
+    # call. An inference must not overwrite a recorded fact, and the dashboard
+    # shows which is which.
+    caller_name: str | None = None,
+    analysis_model: str | None = None,
 ) -> None:
     """Writes the post-call record directly to Supabase. There is no n8n hop
     in this build -- see settings.SlackSettings -- so this and
@@ -207,6 +213,8 @@ async def insert_call_log(
                 # NULL means it never ran. Those are different facts about a call.
                 "user_queries": user_queries,
                 "priority": priority,
+                "caller_name": caller_name,
+                "analysis_model": analysis_model,
                 **cost_fields,
             }
         ).execute()

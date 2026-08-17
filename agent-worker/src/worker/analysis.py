@@ -75,10 +75,18 @@ You are reviewing a finished phone call to a company's AI receptionist.
 Return ONLY a JSON object, with no markdown fence and no commentary:
 
 {
+  "caller_name": "..." | null,
   "user_queries": ["..."],
   "call_summary": "...",
   "priority": "High" | "Medium" | "Low"
 }
+
+caller_name: the caller's own first name, if they actually said it. Null if they
+did not -- do not infer one from a company name, an email address, or the
+agent's own name. If they corrected themselves ("Tim, my name is Diana"), take
+the corrected one. Give the name alone, no title and no surname unless they gave
+one. This is transcribed speech, so spelling may be approximate; return it as
+transcribed rather than normalising it to a name you think it resembles.
 
 user_queries: the caller's substantive statements and requests, cleaned up and
 normalised. Exclude bare confirmations ("yes", "okay", "hello") unless one is
@@ -98,8 +106,10 @@ priority:
   Low    - general information requests, spam and marketing calls, automated
            verification codes, anything not urgent.
 
-Judge only from what was said. Do not guess at names, numbers or companies --
-those are recorded separately and your guess would overwrite a known value."""
+Judge only from what was said. Do not guess at phone numbers or company names --
+those are captured by tools during the call, and a guess here would compete with
+a known value. caller_name is the one exception, and only when the caller stated
+it plainly."""
 
 
 @dataclass
@@ -111,6 +121,20 @@ class CallAnalysis:
     user_queries: list[str] = field(default_factory=list)
     call_summary: str | None = None
     priority: Priority | None = None
+    # The caller's name as the model heard it. Deliberately NOT written to
+    # lead_name: that column is filled by the record_lead_info tool, which the
+    # model calls on purpose when the caller states their name, and it is
+    # therefore ground truth. This is an inference from a transcript that may
+    # itself have misheard the name. Keeping them apart means an agent with the
+    # tool attached still gets the reliable value, and one without it gets
+    # something rather than nothing -- without either silently standing in for
+    # the other.
+    caller_name: str | None = None
+    # Which model produced the three judgements above, so the dashboard can say
+    # where a field came from instead of assuming. Not hardcoded, because
+    # ANALYSIS_LLM can be pointed at Gemini and a label that then read
+    # "DeepSeek" would be a lie.
+    model: str | None = None
 
 
 def call_status(state: CallState, duration_seconds: int | None) -> CallStatus:
@@ -193,6 +217,20 @@ def _parse(raw: str) -> CallAnalysis:
     if isinstance(summary, str) and summary.strip():
         out.call_summary = summary.strip()
 
+    name = data.get("caller_name")
+    if isinstance(name, str):
+        cleaned = name.strip().strip(".,")
+        # A model told to answer null sometimes writes the word instead, and
+        # storing "null" or "unknown" as somebody's name is worse than storing
+        # nothing. Length-capped because a name field is not a place for a
+        # sentence -- if the model explains itself here, drop it.
+        if cleaned.lower() in ("null", "none", "unknown", "n/a", "not provided", ""):
+            cleaned = ""
+        if cleaned and len(cleaned) <= 60:
+            out.caller_name = cleaned
+        elif cleaned:
+            logger.info("caller_name was %d chars, which isn't a name; dropped", len(cleaned))
+
     priority = data.get("priority")
     if isinstance(priority, str):
         # Title-cased so "high" and "HIGH" are both accepted; anything that
@@ -262,8 +300,13 @@ async def analyse(
         return CallAnalysis()
 
     result = _parse(raw)
+    # Recorded from the client that actually answered, not from the setting, so
+    # the label reflects what ran even if the setting changes later.
+    result.model = getattr(llm, "model", None) or provider.analysis_llm
     logger.info(
-        "call analysis: priority=%s queries=%d summary=%s",
+        "call analysis (%s): caller_name=%s priority=%s queries=%d summary=%s",
+        result.model,
+        result.caller_name or "-",
         result.priority or "-",
         len(result.user_queries),
         f"{len(result.call_summary)} chars" if result.call_summary else "-",

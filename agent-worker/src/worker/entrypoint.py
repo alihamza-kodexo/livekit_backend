@@ -1000,6 +1000,11 @@ async def _log_and_notify(
         call_summary=call_analysis.call_summary,
         user_queries=call_analysis.user_queries,
         priority=call_analysis.priority,
+        # Kept apart from lead_name on purpose -- see CallAnalysis.caller_name.
+        # The model that produced it is stored alongside so the dashboard can
+        # attribute the field rather than guess.
+        caller_name=call_analysis.caller_name,
+        analysis_model=call_analysis.model,
     )
 
     # Fires even for test calls -- this is the agent owner's own configured
