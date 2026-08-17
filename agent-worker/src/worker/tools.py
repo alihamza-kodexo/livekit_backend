@@ -322,14 +322,45 @@ def build_record_lead_info_tool(tool_row: Tool) -> RawFunctionTool:
     )
 
 
+def _digits(value: str) -> str:
+    return re.sub(r"\D", "", value)
+
+
 def build_record_callback_number_tool(tool_row: Tool) -> RawFunctionTool:
     """A `tool_type: "record_callback_number"` row -- same fixed behavior
     (feeds the transfer-failed Slack alert) as the old unconditional builtin,
-    opt-in per agent now."""
+    opt-in per agent now.
+
+    `callback_number` is deliberately optional. The single most common answer to
+    "what's the best number to reach you at" is "use this one" / "the number I'm
+    calling from", and the model has no way to honour that: the caller's number
+    lives on CallState for logging and is never put in the prompt. With the
+    argument required, that exchange ended with the agent asking again or saying
+    it couldn't record anything -- and the number was lost on exactly the calls
+    (failed transfers) where it mattered most. Omitted or non-numeric now falls
+    back to the caller ID we already have.
+
+    Returns the number it stored so the model can read it back for confirmation,
+    which is the only check available against a misheard digit.
+    """
 
     async def _record(raw_arguments: dict[str, Any], context: RunContext[CallState]) -> str:
-        context.userdata.transfer_failed_callback_number = raw_arguments.get("callback_number")
-        return "Recorded."
+        state = context.userdata
+        given = str(raw_arguments.get("callback_number") or "").strip()
+
+        # Anything without a plausible run of digits is the model relaying "this
+        # number" rather than a number, so prefer the caller ID over storing prose.
+        if len(_digits(given)) < 7:
+            if not state.caller_number:
+                raise ToolError(
+                    "No number to record -- there's no caller ID on this call. Ask them to "
+                    "read the digits out."
+                )
+            given = state.caller_number
+
+        state.transfer_failed_callback_number = given
+        logger.info("recorded callback number for %s", state.room_name)
+        return f"Recorded {given}. Read it back to confirm it's right."
 
     _record.__name__ = tool_row.name
 
@@ -340,8 +371,15 @@ def build_record_callback_number_tool(tool_row: Tool) -> RawFunctionTool:
             "description": tool_row.description,
             "parameters": {
                 "type": "object",
-                "required": ["callback_number"],
-                "properties": {"callback_number": {"type": "string"}},
+                "properties": {
+                    "callback_number": {
+                        "type": "string",
+                        "description": (
+                            "The number in full. Omit it if the caller says to use the number "
+                            "they're calling from -- their caller ID is used instead."
+                        ),
+                    }
+                },
             },
         },
     )
