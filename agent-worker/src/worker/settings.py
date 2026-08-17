@@ -100,6 +100,13 @@ class ProviderSettings:
     # support it rejects the session outright rather than ignoring the flag.
     gemini_proactive_audio: bool
 
+    # Which LLM writes the post-call analysis -- the summary, the caller's
+    # queries and the priority (see analysis.py). DeepSeek by default, and this
+    # is the one place it's the obvious choice: the job runs after the caller has
+    # hung up, so its ~1.6s per reply costs nothing, and it's roughly a tenth of
+    # Gemini Flash's price for the same work. Set ANALYSIS_LLM=gemini to switch.
+    analysis_llm: str
+
     # --- Turn taking -------------------------------------------------------
     # Which Deepgram STT to run. "flux" uses Deepgram's Flux model, which
     # decides end-of-turn from the speech itself and lets the session stop
@@ -205,6 +212,7 @@ def provider_settings() -> ProviderSettings:
         gemini_llm_model=os.environ.get("GEMINI_LLM_MODEL", "gemini-2.5-flash"),
         gemini_proactive_audio=(os.environ.get("GEMINI_PROACTIVE_AUDIO") or "").strip().lower()
         in ("1", "true", "yes"),
+        analysis_llm=(os.environ.get("ANALYSIS_LLM") or "deepseek").strip().lower(),
         stt_engine=(os.environ.get("DEEPGRAM_STT_ENGINE") or "flux").strip().lower(),
         deepgram_flux_model=os.environ.get("DEEPGRAM_FLUX_MODEL", "flux-general-en"),
         flux_eot_threshold=float(os.environ.get("DEEPGRAM_FLUX_EOT_THRESHOLD", "0.7")),

@@ -36,7 +36,9 @@ from livekit.agents import (
 )
 from livekit.plugins import deepgram, google, groq, openai, silero
 
-from . import deflection, notify, recording, spam
+from livekit.agents.metrics import ModelUsageCollector
+
+from . import analysis, deflection, notify, pricing, recording, spam
 from .flow import InboundCallAgent, stt_keyterm_list
 from .models import AgentConfig, ConversationSettings
 from .settings import ProviderSettings, livekit_settings, provider_settings, recording_settings
@@ -727,6 +729,8 @@ async def _run_call(ctx: JobContext) -> None:
     test_agent_id = _test_agent_id_from_metadata(ctx.job.metadata)
     call_sid: str | None = None
     caller_number: str | None = None
+    # Stays None on the test path, which dials no number at all.
+    called_number: str | None = None
 
     if test_agent_id:
         # Waits for the tester *before* loading the config, not after: a
@@ -747,6 +751,7 @@ async def _run_call(ctx: JobContext) -> None:
     else:
         participant = await ctx.wait_for_participant(kind=rtc.ParticipantKind.PARTICIPANT_KIND_SIP)
         dialed_number = participant.attributes.get("sip.trunkPhoneNumber")
+        called_number = dialed_number
         caller_number = participant.attributes.get("sip.phoneNumber")
         call_sid = participant.attributes.get("sip.twilio.callSid")
 
@@ -786,6 +791,7 @@ async def _run_call(ctx: JobContext) -> None:
         room_name=ctx.room.name,
         call_sid=call_sid,
         caller_number=caller_number,
+        called_number=called_number,
         is_test=bool(test_agent_id),
     )
     state.ai_deflection_index = deflection.start_call_offset()
@@ -802,8 +808,16 @@ async def _run_call(ctx: JobContext) -> None:
         **session_kwargs,
     )
 
+    # Every billable quantity the call consumes -- seconds recognised, tokens in
+    # and out, characters synthesised -- accumulated per (provider, model) so
+    # the shutdown callback can price it. Per model rather than in one bucket
+    # because a single call can legitimately use two STT engines at different
+    # rates: Flux, then nova-3 if the FallbackAdapter switches over mid-call.
+    usage = ModelUsageCollector()
+
     @session.on("metrics_collected")
     def _on_metrics(event: MetricsCollectedEvent) -> None:
+        usage.collect(event.metrics)
         _log_turn_metrics(state, session, event)
 
     @session.on("agent_false_interruption")
@@ -857,6 +871,13 @@ async def _run_call(ctx: JobContext) -> None:
         source = getattr(event.source, "model", None) or type(event.source).__name__
         recoverable = getattr(event.error, "recoverable", None)
         detail = str(getattr(event.error, "message", "") or event.error).strip()
+
+        # Recorded on the call so the log can say the call broke, not just that
+        # it ended. First error wins -- a failing session emits a cascade and the
+        # one that started it is the useful one.
+        state.has_error = True
+        if state.error_message is None:
+            state.error_message = f"{source}: {detail[:300] or 'unknown error'}"
         suffix = (
             " Retrying."
             if recoverable
@@ -879,7 +900,7 @@ async def _run_call(ctx: JobContext) -> None:
         # call_logs.recording_url is populated on the first insert -- the
         # dashboard reads that row once and doesn't poll for a link to appear.
         recording_url = await recording.finish(call_recording)
-        await _log_and_notify(state, session, started_at, recording_url)
+        await _log_and_notify(state, session, started_at, recording_url, usage)
 
     ctx.add_shutdown_callback(_on_shutdown)
 
@@ -921,9 +942,33 @@ async def _log_and_notify(
     session: AgentSession[CallState],
     started_at: float,
     recording_url: str | None = None,
+    # The collector itself rather than its flattened snapshot: the post-call
+    # analysis below adds its own LLM usage to it, so a snapshot taken before
+    # that would price the call without it.
+    usage: ModelUsageCollector | None = None,
 ) -> None:
     duration_seconds = int(time.monotonic() - started_at)
     transcript = _render_transcript(session)
+
+    # After the caller has hung up, so its latency is nobody's problem -- which
+    # is the whole reason DeepSeek is the right model for it. Never raises; a
+    # failure leaves the analysis fields NULL and the row is still written.
+    provider = provider_settings()
+    call_analysis = await analysis.analyse(transcript, provider, usage)
+
+    # Priced after the analysis rather than before, so the collector has already
+    # been handed the analysis LLM's own tokens and they're inside the total.
+    cost = pricing.compute_call_cost(
+        usage.flatten() if usage else [], duration_seconds, is_test=state.is_test
+    )
+    logger.info(
+        "call cost $%.6f (stt $%.6f · llm $%.6f · tts $%.6f · telephony $%.6f est)",
+        cost.total_usd,
+        cost.stt_usd,
+        cost.llm_usd,
+        cost.tts_usd,
+        cost.telephony_usd,
+    )
 
     await insert_call_log(
         recording_url=recording_url,
@@ -940,6 +985,21 @@ async def _log_and_notify(
         lead_company=state.lead_company,
         lead_need=state.lead_need,
         is_test=state.is_test,
+        cost=cost,
+        called_number=state.called_number,
+        # Derived in code rather than asked of the model -- a transfer either ran
+        # or it didn't, and the session either errored or it didn't. See
+        # analysis.py's module docstring on why only three fields need an LLM.
+        call_status=analysis.call_status(state, duration_seconds),
+        transfer_attempted=analysis.transfer_attempted(state),
+        callback_needed=analysis.callback_needed(state),
+        has_error=state.has_error,
+        error_message=state.error_message,
+        # The three the model actually judged. None/empty when the analysis
+        # didn't run or couldn't be parsed.
+        call_summary=call_analysis.call_summary,
+        user_queries=call_analysis.user_queries,
+        priority=call_analysis.priority,
     )
 
     # Fires even for test calls -- this is the agent owner's own configured

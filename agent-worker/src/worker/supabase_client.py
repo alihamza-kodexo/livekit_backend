@@ -20,6 +20,7 @@ from .models import (
     CallOutcome,
     Tool,
 )
+from .pricing import CallCost
 from .settings import supabase_settings
 
 logger = logging.getLogger("worker.supabase")
@@ -135,10 +136,46 @@ async def insert_call_log(
     lead_company: str | None,
     lead_need: str | None,
     is_test: bool = False,
+    # What the call cost, split by the thing that charges for it -- see
+    # pricing.py. None means it couldn't be computed; the columns stay NULL
+    # rather than recording a call as free.
+    cost: CallCost | None = None,
+    # --- Post-call analysis (see analysis.py) -------------------------------
+    # The number the caller dialled, and four facts derived in code from what
+    # the session did. None of these needs a model; they're recorded because the
+    # call record couldn't previously answer "did that call actually work".
+    called_number: str | None = None,
+    call_status: str | None = None,
+    transfer_attempted: bool | None = None,
+    callback_needed: bool | None = None,
+    has_error: bool | None = None,
+    error_message: str | None = None,
+    # The three an LLM judged. All None/empty when the analysis didn't run --
+    # a short transcript, a timeout, a provider outage. NULL says "not analysed",
+    # which is the truth; a default would claim a judgement nobody made.
+    call_summary: str | None = None,
+    user_queries: list[str] | None = None,
+    priority: str | None = None,
 ) -> None:
     """Writes the post-call record directly to Supabase. There is no n8n hop
     in this build -- see settings.SlackSettings -- so this and
     notify.py::send_call_summary are the entire Phase 6 replacement."""
+
+    # Rounded to the microdollar the column stores. A three-minute call costs
+    # around $0.07, so the interesting digits are the fourth and fifth -- these
+    # cannot be rounded to cents without every row reading $0.00.
+    cost_fields: dict[str, Any] = (
+        {
+            "cost_stt_usd": round(cost.stt_usd, 6),
+            "cost_llm_usd": round(cost.llm_usd, 6),
+            "cost_tts_usd": round(cost.tts_usd, 6),
+            "cost_telephony_usd": round(cost.telephony_usd, 6),
+            "cost_total_usd": round(cost.total_usd, 6),
+            "cost_breakdown": cost.breakdown(),
+        }
+        if cost is not None
+        else {}
+    )
 
     client = await get_client()
     try:
@@ -158,6 +195,19 @@ async def insert_call_log(
                 "lead_company": lead_company,
                 "lead_need": lead_need,
                 "is_test": is_test,
+                "called_number": called_number,
+                "call_status": call_status,
+                "transfer_attempted": transfer_attempted,
+                "callback_needed": callback_needed,
+                "has_error": has_error,
+                "error_message": error_message,
+                "call_summary": call_summary,
+                # Written even when empty, and the distinction matters: [] means
+                # the analysis ran and found nothing substantive the caller said,
+                # NULL means it never ran. Those are different facts about a call.
+                "user_queries": user_queries,
+                "priority": priority,
+                **cost_fields,
             }
         ).execute()
     except Exception:

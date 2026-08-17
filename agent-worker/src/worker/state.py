@@ -19,6 +19,11 @@ class CallState:
     room_name: str
     call_sid: str | None = None
     caller_number: str | None = None
+    # The number the caller dialled (sip.trunkPhoneNumber). Read at answer time
+    # to resolve which agent owns the call, and kept because it's also the only
+    # record of *which* of an agent's numbers was rung -- worth having once an
+    # agent fronts more than one. None for a browser test, which dials nothing.
+    called_number: str | None = None
     # True for a dashboard "test this agent" session (see entrypoint.py) --
     # skips call_logs/Slack so test runs don't pollute real call history.
     is_test: bool = False
@@ -36,6 +41,15 @@ class CallState:
     outcome: CallOutcome | None = None
     matched_department: str | None = None
     transfer_failed_callback_number: str | None = None
+
+    # Whether the session broke mid-call, and the first reason it gave. Set by
+    # entrypoint's ErrorEvent handler, which until now only reported the failure
+    # to the caller and the log -- so "did that call actually work" was a
+    # question the call record couldn't answer. The *first* error is kept rather
+    # than the last: a failing session tends to emit a cascade, and the one that
+    # started it is the useful one.
+    has_error: bool = False
+    error_message: str | None = None
 
     # Which spam detector fired and why (see spam.py). Set alongside a
     # spam_bot/spam_sales outcome, and worth more than the outcome alone: those

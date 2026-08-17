@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from livekit.agents import JobContext
 from livekit.agents.llm import ChatContext
 
+from .llm_clients import build_utility_llm
 from .models import DETECTOR_TOOL_TYPES, AgentConfig, CallOutcome
 from .settings import ProviderSettings
 from .state import CallState
@@ -145,47 +146,10 @@ def literal_match(transcript: str, detectors: list[Detector]) -> Detection | Non
 
 
 def _build_classifier_llm(provider_name: str, provider: ProviderSettings):
-    """A small, separate LLM client for classification.
-
-    Separate from the conversation's LLM on purpose: the two are chosen for
-    different jobs. Gemini Flash is the default because time matters here --
-    DeepSeek's origin API measured ~1.6s per reply against Flash's ~450-500ms
-    time-to-first-token (see the 0019 migration), and on a first-reply gate that
-    is the difference between dropping a robocall in one second and in four.
-    """
-    # Imported lazily so a worker that never runs a detector doesn't pay the
-    # plugin import cost, matching how recording.py treats cloudinary.
-    if provider_name == "deepseek":
-        from livekit.plugins import openai
-
-        if not provider.deepseek_api_key:
-            raise RuntimeError("detector_llm is 'deepseek' but DEEPSEEK_API_KEY isn't set")
-        kwargs: dict = {
-            "api_key": provider.deepseek_api_key,
-            "base_url": provider.deepseek_base_url,
-            "model": provider.deepseek_model,
-            # Classification wants the single most likely label, not variety.
-            "temperature": 0.0,
-        }
-        # Same origin-only guard as the conversation LLM: third-party hosts
-        # reject unknown body parameters with a 400 rather than ignoring them.
-        if "api.deepseek.com" in provider.deepseek_base_url:
-            kwargs["extra_body"] = {"thinking": {"type": "disabled"}}
-        return openai.LLM(**kwargs)
-
-    from google.genai import types as genai_types
-    from livekit.plugins import google
-
-    if not provider.gemini_api_key:
-        raise RuntimeError("detector_llm is 'gemini' but GEMINI_API_KEY isn't set")
-    return google.LLM(
-        api_key=provider.gemini_api_key,
-        model=provider.gemini_llm_model,
-        temperature=0.0,
-        # Same reasoning as the conversation LLM: deliberation before the first
-        # token is pure delay, and this is a one-word labelling task.
-        thinking_config=genai_types.ThinkingConfig(thinking_budget=0),
-    )
+    """The classifier's LLM -- see llm_clients.build_utility_llm, which
+    analysis.py shares. Gemini Flash is the default for this caller because this
+    one gates a live call and latency is the binding constraint."""
+    return build_utility_llm(provider_name, provider)
 
 
 def _classifier_prompt(detectors: list[Detector]) -> str:
