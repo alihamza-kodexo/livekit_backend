@@ -31,10 +31,13 @@ logger = logging.getLogger("worker.tools")
 # what it *does* is not something an admin should be able to change, since
 # getting it wrong means either a call that never ends or one cut off mid-word.
 _END_CALL_DESCRIPTION = (
-    "End the call. Only call this AFTER you have already spoken your closing line out loud "
-    "-- this waits for that line to finish playing, then hangs up. Use outcome='not_qualified' "
-    "for a normal close, 'dropped' for a scam/fake-verification call you're ending immediately, "
-    "or leave outcome unset if it was already set by a transfer."
+    "End the call. Speak your closing line and call this in the SAME turn -- it waits for your "
+    "line to finish playing before hanging up, so the caller hears all of it. Do not save this "
+    "for a later turn: once you finish speaking the turn is over and you will not get another "
+    "one unless the caller speaks again, so a goodbye without this call just leaves them on a "
+    "silent line. Use outcome='not_qualified' for a normal close, 'dropped' for a "
+    "scam/fake-verification call you're ending immediately, or leave outcome unset if it was "
+    "already set by a transfer."
 )
 
 
