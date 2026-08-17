@@ -183,6 +183,12 @@ ToolType = Literal[
     "transfer_call",
     "record_lead_info",
     "record_callback_number",
+    # Hanging up. Unlike every other type here, this one has a builtin fallback:
+    # an agent with no end_call row attached still gets the default tool, because
+    # an agent that *cannot* hang up doesn't end its calls -- it holds the line
+    # until LiveKit's room timeout expires, billing telephony the whole time.
+    # Attaching a row replaces the default description with an admin's own.
+    "end_call",
     # The two detector types are the odd ones out: they are configuration rows,
     # not callable functions. build_agent_tools deliberately doesn't build them,
     # because handing the model a "hang up on spam" function would put the

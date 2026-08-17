@@ -75,7 +75,9 @@ class InboundCallAgent(Agent):
         super().__init__(
             instructions=_build_instructions(config),
             tools=[
-                *tools.builtin_tools(),
+                # Passed the agent's rows so it can stand down if one of them is
+                # its own end_call tool -- see tools.builtin_tools.
+                *tools.builtin_tools(config.tools),
                 *tools.build_agent_tools(config.tools),
                 *tools.build_knowledge_tool(config.agent),
             ],

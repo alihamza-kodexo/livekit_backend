@@ -26,18 +26,19 @@ from .state import CallState
 logger = logging.getLogger("worker.tools")
 
 
-@function_tool(
-    name="end_call",
-    description=(
-        "End the call. Only call this AFTER you have already spoken your closing line out loud "
-        "-- this waits for that line to finish playing, then hangs up. Use outcome='not_qualified' "
-        "for a normal close, 'dropped' for a scam/fake-verification call you're ending immediately, "
-        "or leave outcome unset if it was already set by a transfer."
-    ),
+# The mechanics of hanging up, shared by the builtin below and by any admin
+# -configured `end_call` tool row. Only the description differs between them --
+# what it *does* is not something an admin should be able to change, since
+# getting it wrong means either a call that never ends or one cut off mid-word.
+_END_CALL_DESCRIPTION = (
+    "End the call. Only call this AFTER you have already spoken your closing line out loud "
+    "-- this waits for that line to finish playing, then hangs up. Use outcome='not_qualified' "
+    "for a normal close, 'dropped' for a scam/fake-verification call you're ending immediately, "
+    "or leave outcome unset if it was already set by a transfer."
 )
-async def end_call(
-    context: RunContext[CallState], outcome: str | None = None
-) -> str:
+
+
+async def _hang_up(context: RunContext[CallState], outcome: str | None = None) -> str:
     state = context.userdata
     if outcome and state.outcome is None:
         state.outcome = outcome  # type: ignore[assignment]
@@ -50,6 +51,48 @@ async def end_call(
     return "Call ending."
 
 
+@function_tool(name="end_call", description=_END_CALL_DESCRIPTION)
+async def end_call(context: RunContext[CallState], outcome: str | None = None) -> str:
+    return await _hang_up(context, outcome)
+
+
+def build_end_call_tool(tool_row: Tool) -> RawFunctionTool:
+    """A `tool_type: "end_call"` row -- the same hang-up behaviour as the builtin,
+    under an admin's own name and description.
+
+    The point of allowing this is that *when* to hang up is genuinely
+    agent-specific ("end once they've booked a slot", "end after two refusals"),
+    and until now the only way to influence it was the agent's end-call
+    instructions field, which is prose in the system prompt rather than something
+    attached to the tool the model actually calls. A tool description is read by
+    the model on every turn as part of the function schema, so conditions written
+    here carry more weight than the same words buried in a prompt.
+
+    The admin's description is appended to the default rather than replacing it.
+    The default explains the *mechanics* -- speak your closing line first, pass an
+    outcome -- which an admin writing "end after booking" has no reason to
+    restate and every reason not to accidentally drop. Getting that half wrong
+    produces calls cut off mid-sentence.
+    """
+
+    async def _end(raw_arguments: dict[str, Any], context: RunContext[CallState]) -> str:
+        return await _hang_up(context, raw_arguments.get("outcome"))
+
+    _end.__name__ = tool_row.name
+
+    return function_tool(
+        _end,
+        raw_schema={
+            "name": tool_row.name,
+            "description": f"{tool_row.description}\n\n{_END_CALL_DESCRIPTION}",
+            "parameters": {
+                "type": "object",
+                "properties": {"outcome": {"type": "string"}},
+            },
+        },
+    )
+
+
 def _find_sip_participant(job_ctx: Any):
     for participant in job_ctx.room.remote_participants.values():
         if participant.kind == rtc.ParticipantKind.PARTICIPANT_KIND_SIP:
@@ -57,7 +100,22 @@ def _find_sip_participant(job_ctx: Any):
     return None
 
 
-def builtin_tools() -> list:
+def builtin_tools(tool_rows: list[Tool] | None = None) -> list:
+    """The tools every agent gets regardless of configuration -- just hanging up.
+
+    Suppressed when the agent has its own enabled `end_call` row, so the model
+    isn't handed two tools that do the same thing under different names and left
+    to pick. Otherwise the builtin stands: an agent that cannot hang up doesn't
+    end its calls, it holds the line until LiveKit's room timeout expires while
+    telephony bills for every minute. That failure is bad enough that end_call is
+    the one type which stays opt-*out* rather than opt-in.
+    """
+    configured = any(
+        row.tool_type == "end_call" and row.is_enabled for row in (tool_rows or [])
+    )
+    if configured:
+        logger.info("agent has its own end_call tool; not adding the builtin")
+        return []
     return [end_call]
 
 
@@ -248,6 +306,9 @@ _TOOL_BUILDERS = {
     "transfer_call": build_transfer_call_tool,
     "record_lead_info": build_record_lead_info_tool,
     "record_callback_number": build_record_callback_number_tool,
+    # Also has a builtin fallback -- see builtin_tools(), which stands down when
+    # an enabled row of this type is attached so the model isn't offered two.
+    "end_call": build_end_call_tool,
 }
 
 
