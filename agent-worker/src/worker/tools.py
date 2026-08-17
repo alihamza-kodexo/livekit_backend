@@ -64,6 +64,11 @@ async def _hang_up(context: RunContext[CallState], outcome: str | None = None) -
     if outcome and state.outcome is None:
         state.outcome = outcome  # type: ignore[assignment]
 
+    # Whether the model reached for this at all is the first question asked every
+    # time a call fails to end, and it used to be unanswerable from the log: a
+    # hang-up that raised looked identical to one the model never requested.
+    logger.info("hanging up: tool=%s outcome=%s", context.function_call.name, state.outcome)
+
     # Let the closing line finish playing before the room disconnects under it.
     #
     # It must be RunContext.wait_for_playout, never SpeechHandle.wait_for_playout:
