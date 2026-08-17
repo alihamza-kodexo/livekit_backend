@@ -65,10 +65,31 @@ async def _hang_up(context: RunContext[CallState], outcome: str | None = None) -
         state.outcome = outcome  # type: ignore[assignment]
 
     # Let the closing line finish playing before the room disconnects under it.
-    await context.speech_handle.wait_for_playout()
+    #
+    # It must be RunContext.wait_for_playout, never SpeechHandle.wait_for_playout:
+    # the handle waits for the *entire* turn, which includes this tool, so calling
+    # it from in here is a circular wait. The SDK guards against exactly that and
+    # raises RuntimeError (speech_handle.py:186-199) rather than deadlocking -- and
+    # a tool that raises never reaches delete_room, so the call simply carried on.
+    # The framework then fed the error back to the model, which apologised and
+    # asked the caller to repeat themselves right after they'd said goodbye. This
+    # is also why hanging up from spam.py always worked: that path calls
+    # delete_room from the classifier task, not from inside a tool.
+    #
+    # RunContext's version waits only for the speech generated *before* this call
+    # in the same step, which is precisely the closing line. Interruption resolves
+    # it too (_mark_done marks the generation done), so a caller talking over the
+    # goodbye can't wedge the hang-up.
+    try:
+        await context.wait_for_playout()
+    except Exception:
+        # Never let this stop the hang-up: the cost of not ending a call is a line
+        # held open and billed until LiveKit's room timeout, which is far worse
+        # than clipping the last word of a goodbye.
+        logger.exception("waiting for the closing line failed; hanging up anyway")
 
     job_ctx = get_job_context()
-    job_ctx.delete_room()
+    await job_ctx.delete_room()
 
 
 @function_tool(name="end_call", description=_END_CALL_DESCRIPTION)
