@@ -16,7 +16,7 @@ import re
 from typing import Any
 
 import httpx
-from livekit import rtc
+from livekit import api, rtc
 from livekit.agents import RunContext, get_job_context
 from livekit.agents.llm import RawFunctionTool, ToolError, function_tool
 
@@ -228,6 +228,22 @@ def _as_transfer_uri(destination: str) -> str:
     return f"tel:{compact}"
 
 
+# How long to let the destination ring before giving up on a transfer.
+#
+# The SDK's default is 30s (livekit/api/_dial_timeout.py), and that is not enough
+# for a person to reach a phone: on a US-to-UK transfer the callee picked up at
+# 16:23:49 having been rung from roughly 16:23:15, by which point the 30s window
+# had expired, the tool had raised, and the agent had already told the caller
+# "the team is currently unavailable" -- on a transfer that then went through and
+# ran for 25 seconds. The call was logged transfer_failed while the two of them
+# were talking. A timeout shorter than a human's reaction time turns every slow
+# answer into a phantom failure.
+#
+# A longer window costs nothing when nobody answers: the caller hears ringing
+# either way, and ringing is what people expect a transfer to sound like.
+_TRANSFER_RINGING_TIMEOUT = 45
+
+
 def build_transfer_call_tool(tool_row: Tool) -> RawFunctionTool:
     """A `tool_type: "transfer_call"` row -- SIP-transfers to the fixed
     number the admin set on this specific tool. One tool per destination
@@ -246,8 +262,20 @@ def build_transfer_call_tool(tool_row: Tool) -> RawFunctionTool:
             raise ToolError("No SIP participant found in the room to transfer.")
 
         transfer_to = _as_transfer_uri(tool_row.destination_number)
+
+        # Built by hand rather than via job_ctx.transfer_sip_participant, which
+        # exposes neither of the two settings that decide whether a transfer is
+        # survivable for the person on the phone. See the constants above.
+        request = api.TransferSIPParticipantRequest(
+            room_name=job_ctx.room.name,
+            participant_identity=participant.identity,
+            transfer_to=transfer_to,
+            play_dialtone=True,
+        )
+        request.ringing_timeout.seconds = _TRANSFER_RINGING_TIMEOUT
+
         try:
-            await job_ctx.transfer_sip_participant(participant, transfer_to)
+            await job_ctx.api.sip.transfer_sip_participant(request)
         except Exception as e:
             # Logs the URI actually sent, not the row's raw value -- when a
             # transfer is rejected, what went on the wire is the thing in
