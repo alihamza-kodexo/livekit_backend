@@ -64,6 +64,14 @@ async def _hang_up(context: RunContext[CallState], outcome: str | None = None) -
     if outcome and state.outcome is None:
         state.outcome = outcome  # type: ignore[assignment]
 
+    # Claimed here rather than after the room is gone, and before the playout
+    # wait below rather than after it: everything past this point can raise, and
+    # a hang-up the agent definitely asked for must not be recorded as anything
+    # else because the closing line stumbled. The caller-disconnect handler in
+    # entrypoint.py fires a moment from now as a consequence of delete_room, and
+    # claim_end's first-writer-wins rule is what stops it relabelling this.
+    state.claim_end("agent", "end_call_tool")
+
     # Whether the model reached for this at all is the first question asked every
     # time a call fails to end, and it used to be unanswerable from the log: a
     # hang-up that raised looked identical to one the model never requested.
@@ -290,6 +298,11 @@ def build_transfer_call_tool(tool_row: Tool) -> RawFunctionTool:
 
         state.outcome = "department_transfer"
         state.matched_department = tool_row.name
+        # The agent ended this leg of the call, even though nobody hung up: the
+        # caller leaves the room because we handed them somewhere else. Recorded
+        # as such so a transfer isn't counted among the calls people abandoned.
+        # Which destination is already in matched_department.
+        state.claim_end("agent", "transferred")
         return "Transferred."
 
     _transfer.__name__ = tool_row.name

@@ -150,6 +150,12 @@ async def insert_call_log(
     callback_needed: bool | None = None,
     has_error: bool | None = None,
     error_message: str | None = None,
+    # Who ended the call and why -- observed during it, not inferred afterwards.
+    # Both None on a call that ended in a way nothing claimed, which the row
+    # keeps as NULL: "we didn't record this" is a different fact from any of the
+    # actors, and the wrong one to invent. See the 0025 migration.
+    ended_by: str | None = None,
+    end_reason: str | None = None,
     # The three an LLM judged. All None/empty when the analysis didn't run --
     # a short transcript, a timeout, a provider outage. NULL says "not analysed",
     # which is the truth; a default would claim a judgement nobody made.
@@ -207,6 +213,8 @@ async def insert_call_log(
                 "callback_needed": callback_needed,
                 "has_error": has_error,
                 "error_message": error_message,
+                "ended_by": ended_by,
+                "end_reason": end_reason,
                 "call_summary": call_summary,
                 # Written even when empty, and the distinction matters: [] means
                 # the analysis ran and found nothing substantive the caller said,

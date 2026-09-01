@@ -314,5 +314,12 @@ def watch_first_reply(
         # still recorded even though the caller was given no explanation.
         state.outcome = detection.outcome
         state.spam_detection = detection.detail
+        # "system", not "agent": this runs in the classifier task, outside the
+        # conversation, and the model was never asked. Keeping the two apart is
+        # what lets "the agent decided to hang up" be counted separately from
+        # "a detector dropped the call" -- which is the number that matters when
+        # reviewing whether a statement list is too broad. The reason detail is
+        # already in spam_detection.
+        state.claim_end("system", "spam_filter")
         logger.info("ending call as spam -- %s", detection.detail)
         ctx.delete_room()

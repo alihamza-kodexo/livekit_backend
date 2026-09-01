@@ -40,7 +40,7 @@ from livekit.agents.metrics import ModelUsageCollector
 
 from . import analysis, deflection, notify, pricing, recording, spam
 from .flow import InboundCallAgent, stt_keyterm_list
-from .models import AgentConfig, ConversationSettings
+from .models import AgentConfig, ConversationSettings, EndedBy
 from .settings import ProviderSettings, livekit_settings, provider_settings, recording_settings
 from .state import CallState
 from .supabase_client import insert_call_log, load_agent_config_by_id, load_agent_config_by_number
@@ -149,7 +149,52 @@ def _watch_caller_audio(ctx: JobContext) -> None:
         asyncio.run_coroutine_threadsafe(guarded(), loop)
 
 
-def _end_job_when_caller_leaves(ctx: JobContext, identity: str) -> None:
+def _end_attribution_for(
+    reason: "rtc.DisconnectReason.ValueType | None",
+) -> tuple[EndedBy, str] | None:
+    """Turn LiveKit's disconnect reason into who ended the call and why.
+
+    Returns None when the disconnect says nothing about who chose it -- which is
+    the important case, not an edge case. ROOM_DELETED and PARTICIPANT_REMOVED
+    mean *our* side ended the call and the caller was disconnected as a
+    consequence, so attributing them to the caller would relabel every clean
+    end_call and every spam drop as an abandoned call. Whoever deleted the room
+    has already claimed the end by the time this runs; returning None leaves
+    that claim standing.
+
+    A telephony failure is likewise not a caller hangup. Someone reading "caller
+    hung up" on a call the trunk dropped would draw exactly the wrong conclusion
+    about the agent.
+    """
+    disconnect = rtc.DisconnectReason
+    if reason in (disconnect.ROOM_DELETED, disconnect.PARTICIPANT_REMOVED):
+        return None
+    if reason == disconnect.CLIENT_INITIATED:
+        return "caller", "caller_hung_up"
+    if reason in (
+        disconnect.SIP_TRUNK_FAILURE,
+        disconnect.CONNECTION_TIMEOUT,
+        disconnect.MEDIA_FAILURE,
+        disconnect.USER_UNAVAILABLE,
+        disconnect.USER_REJECTED,
+        disconnect.SIGNAL_CLOSE,
+    ):
+        return "telephony", disconnect.Name(reason).lower()
+    if reason in (disconnect.SERVER_SHUTDOWN, disconnect.DUPLICATE_IDENTITY, disconnect.MIGRATION):
+        return "system", disconnect.Name(reason).lower()
+
+    # None -- the SDK maps UNKNOWN_REASON to it, and it is also what an
+    # unpopulated field looks like. The participant left and nothing on our side
+    # claimed it, so the caller leaving is the likeliest explanation, but it is
+    # an inference and gets its own slug saying so. Keeping it distinct from a
+    # read CLIENT_INITIATED is what makes "how often do we actually know?"
+    # answerable from the table instead of assumed.
+    if reason is None:
+        return "caller", "caller_hung_up_unconfirmed"
+    return "unknown", disconnect.Name(reason).lower()
+
+
+def _end_job_when_caller_leaves(ctx: JobContext, identity: str, state: CallState) -> None:
     """Shut the job down as soon as the caller hangs up.
 
     `close_on_disconnect` already closes the *session* when the caller leaves,
@@ -179,8 +224,23 @@ def _end_job_when_caller_leaves(ctx: JobContext, identity: str) -> None:
         # the dashboard's tester alike.
         if participant.identity != identity:
             return
-        logger.info("%s disconnected; ending the job so the recording stops here", identity)
-        loop.call_soon_threadsafe(ctx.shutdown, "caller hung up")
+
+        # Logged raw as well as mapped: this is the only place the call record
+        # learns how the line actually went away, and a run of rows attributed
+        # from a None reason should be visible as such rather than read as
+        # confirmed caller hangups.
+        reason = participant.disconnect_reason
+        attribution = _end_attribution_for(reason)
+        if attribution is not None:
+            state.claim_end(*attribution)
+        logger.info(
+            "%s disconnected; ending the job so the recording stops here (reason=%s)",
+            identity,
+            rtc.DisconnectReason.Name(reason) if reason is not None else "unreported",
+        )
+        # The shutdown reason and the row now say the same thing, so the log and
+        # call_logs can't disagree about the same call.
+        loop.call_soon_threadsafe(ctx.shutdown, state.end_reason or "caller hung up")
 
 
 async def _report_diagnostic(ctx: JobContext, message: str) -> None:
@@ -895,7 +955,18 @@ async def _run_call(ctx: JobContext) -> None:
     # problem with storing its audio is far worse than losing the audio.
     call_recording: recording.Recording | None = None
 
-    async def _on_shutdown() -> None:
+    async def _on_shutdown(reason: str) -> None:
+        # The reason argument is the SDK's, not ours: a shutdown callback may
+        # take it (job.py's add_shutdown_callback wraps zero-arg ones), and it
+        # carries whatever ended the job -- our own "caller hung up", or the
+        # framework's own words when the worker is going down under a live call.
+        #
+        # Last resort only. Anything that actually knows why the call ended has
+        # claimed it by now; this catches the calls nothing claimed, which would
+        # otherwise be indistinguishable from calls written before any of this
+        # existed. "system" because by definition no one on the call chose it.
+        state.claim_end("system", f"shutdown: {reason}"[:200])
+
         # Finalised and uploaded before the row is written, not after, so
         # call_logs.recording_url is populated on the first insert -- the
         # dashboard reads that row once and doesn't poll for a link to appear.
@@ -915,7 +986,7 @@ async def _run_call(ctx: JobContext) -> None:
     # means a caller who hangs up during startup gets a teardown that sees None
     # and leaves the egress running to the room timeout -- the exact thing this
     # is here to prevent.
-    _end_job_when_caller_leaves(ctx, participant.identity)
+    _end_job_when_caller_leaves(ctx, participant.identity, state)
 
     await session.start(
         InboundCallAgent(config),
@@ -995,6 +1066,13 @@ async def _log_and_notify(
         callback_needed=analysis.callback_needed(state),
         has_error=state.has_error,
         error_message=state.error_message,
+        # Who ended the call and why -- claimed during the call by whichever
+        # path got there first (see CallState.claim_end), not reconstructed here
+        # from the outcome. Deliberately kept out of analysis.py: this is
+        # observed, and asking a model to guess it from a transcript is exactly
+        # the mistake 0022's docstring describes.
+        ended_by=state.ended_by,
+        end_reason=state.end_reason,
         # The three the model actually judged. None/empty when the analysis
         # didn't run or couldn't be parsed.
         call_summary=call_analysis.call_summary,
@@ -1026,6 +1104,8 @@ async def _log_and_notify(
         lead_need=state.lead_need,
         qualification_answers=state.qualification_answers,
         is_test=state.is_test,
+        ended_by=state.ended_by,
+        end_reason=state.end_reason,
     )
 
     if state.is_test:

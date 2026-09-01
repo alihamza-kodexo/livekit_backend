@@ -46,6 +46,15 @@ CallOutcome = Literal[
     "spam_sales",
 ]
 
+# Who ended the call -- see CallState.claim_end and the 0025 migration. Separate
+# from CallOutcome, which says what the call was *for*: an agent hanging up on a
+# robocall and an agent hanging up on a qualified lead are the same actor and
+# different outcomes.
+#
+# "telephony" is not a caller hangup and must never be recorded as one: the line
+# failed (SIP trunk, media, timeout) rather than anyone choosing to end the call.
+EndedBy = Literal["agent", "caller", "system", "telephony", "unknown"]
+
 
 @dataclass(frozen=True)
 class QualificationCriterion:

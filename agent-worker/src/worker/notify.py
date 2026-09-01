@@ -82,6 +82,13 @@ async def send_end_call_webhook(
     lead_need: str | None,
     qualification_answers: dict[str, Any],
     is_test: bool,
+    # Who ended the call and why -- see CallState.claim_end. Sent because a CRM
+    # syncing these records cares a great deal whether the caller abandoned the
+    # call or the agent finished it, and `outcome` alone doesn't say: a caller
+    # who hangs up mid-qualification leaves it null, exactly like a call that
+    # broke. Both None on a call that ended in a way nothing claimed.
+    ended_by: str | None = None,
+    end_reason: str | None = None,
 ) -> None:
     """Posts the full call record to the agent's own configured webhook
     (Prompt & qualification tab), for whoever wants call data outside Slack/
@@ -114,6 +121,8 @@ async def send_end_call_webhook(
         "lead_need": lead_need,
         "qualification_answers": qualification_answers,
         "is_test": is_test,
+        "ended_by": ended_by,
+        "end_reason": end_reason,
     }
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:

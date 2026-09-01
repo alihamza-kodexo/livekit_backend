@@ -7,10 +7,13 @@ Agent phase still be there when a later phase (or the post-call logger) needs it
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from .models import AgentConfig, CallOutcome
+from .models import AgentConfig, CallOutcome, EndedBy
+
+logger = logging.getLogger("worker.state")
 
 
 @dataclass
@@ -60,3 +63,38 @@ class CallState:
     # Rotates through the "are you AI?" deflection lines (FSD Section 4.5-ish
     # human-likeness requirement) so no line repeats within a single call.
     ai_deflection_index: int = 0
+
+    # Who ended the call and why -- see claim_end below, and migration 0025 for
+    # why these are two fields rather than one. Both stay None on a call that
+    # ended in some way nothing thought to claim, which the row records as NULL
+    # rather than guessing.
+    ended_by: EndedBy | None = None
+    end_reason: str | None = None
+
+    def claim_end(self, actor: EndedBy, reason: str) -> None:
+        """Record who ended the call. The first claim wins; later ones are
+        ignored.
+
+        That rule is the whole reason this is a method rather than two
+        assignments. Ending a call from our side deletes the room, and deleting
+        the room disconnects the caller -- so entrypoint's
+        `participant_disconnected` handler fires on *every* clean hang-up, a
+        moment after the agent's own claim. Last-writer-wins would therefore
+        label every successful end_call as a caller hangup, which is precisely
+        backwards.
+
+        Same convention as `has_error` above: the first thing to happen is the
+        thing that explains the call.
+        """
+        if self.ended_by is not None:
+            logger.debug(
+                "call end already claimed by %s (%s); ignoring later claim %s (%s)",
+                self.ended_by,
+                self.end_reason,
+                actor,
+                reason,
+            )
+            return
+        self.ended_by = actor
+        self.end_reason = reason
+        logger.info("call end claimed: ended_by=%s reason=%s", actor, reason)
