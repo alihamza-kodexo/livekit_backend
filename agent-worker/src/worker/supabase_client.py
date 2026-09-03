@@ -171,7 +171,7 @@ async def insert_call_log(
 ) -> None:
     """Writes the post-call record directly to Supabase. There is no n8n hop
     in this build -- see settings.SlackSettings -- so this and
-    notify.py::send_call_summary are the entire Phase 6 replacement."""
+    notify.py::send_lead_alert are the entire Phase 6 replacement."""
 
     # Rounded to the microdollar the column stores. A three-minute call costs
     # around $0.07, so the interesting digits are the fourth and fifth -- these

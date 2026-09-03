@@ -173,6 +173,34 @@ def callback_needed(state: CallState) -> bool:
     return bool(state.transfer_failed_callback_number)
 
 
+# Outcomes that disqualify a call from being a lead no matter what was captured.
+# Only the spam ones: a robocall that recited a company name is not a lead, and
+# these calls are hung up on mid-sentence anyway (see spam.py).
+_NOT_A_LEAD = ("spam_bot", "spam_sales")
+
+
+def is_lead(state: CallState) -> bool:
+    """Whether this call produced a lead worth telling someone about.
+
+    Keyed on what was *captured*, not on the outcome the model chose. The
+    record_lead_info tool only runs when the agent deliberately calls it, so a
+    name, company or need in state is evidence a human gave real details --
+    which is a firmer thing than `outcome == "qualified"`, a label the model
+    can simply forget to set. A call that captured details and ended without an
+    outcome is still a lead; the details are sitting right there.
+
+    The exception is spam, which is excluded on outcome regardless of what was
+    captured -- see _NOT_A_LEAD.
+
+    Any one of the three fields is enough on purpose. A caller who gives a name
+    and a need but no company has not given less of a lead, and requiring all
+    three would drop real ones for a formatting reason.
+    """
+    if state.outcome in _NOT_A_LEAD:
+        return False
+    return bool(state.lead_name or state.lead_company or state.lead_need)
+
+
 def _parse(raw: str) -> CallAnalysis:
     """Coerce the model's answer into the dataclass, field by field.
 

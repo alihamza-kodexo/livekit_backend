@@ -1115,16 +1115,27 @@ async def _log_and_notify(
         logger.info("test session for agent %s logged, not notifying", state.config.agent.agent_id)
         return
 
+    agent = state.config.agent
+    if not agent.slack_notifications_enabled:
+        # Off by default, per agent -- see the 0026 migration. Logged rather
+        # than passed over silently, so "why is this agent not posting" is
+        # answerable from the worker log without reading the database.
+        logger.info("Slack notifications are off for agent %s; not posting", agent.agent_id)
+        return
+
     if state.outcome == "transfer_failed" and state.matched_department:
+        # Kept regardless of whether a lead was captured: this isn't a
+        # notification, it's an unpaid obligation. The caller was told someone
+        # would ring them back, and nobody will unless this is seen.
         await notify.send_transfer_failure_alert(
-            agent=state.config.agent,
+            agent=agent,
             caller_number=state.caller_number,
             department_name=state.matched_department,
             callback_number=state.transfer_failed_callback_number,
         )
-    else:
-        await notify.send_call_summary(
-            agent=state.config.agent,
+    elif analysis.is_lead(state):
+        await notify.send_lead_alert(
+            agent=agent,
             caller_number=state.caller_number,
             outcome=state.outcome,
             duration_seconds=duration_seconds,
@@ -1133,6 +1144,11 @@ async def _log_and_notify(
             lead_company=state.lead_company,
             lead_need=state.lead_need,
         )
+    else:
+        # Every other call -- spam, wrong numbers, calls that dropped before
+        # anyone said anything -- is recorded in call_logs and shown in the
+        # dashboard, and deliberately does not become a message. See 0026.
+        logger.info("no lead captured on this call; not posting to Slack")
 
 
 def _render_transcript(session: AgentSession) -> str:

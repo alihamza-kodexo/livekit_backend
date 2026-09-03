@@ -157,6 +157,11 @@ class Agent:
     # Posted the full call record (transcript, outcome, lead info, etc.) once
     # the call ends -- see notify.send_end_call_webhook. Null means "don't send".
     end_call_webhook_url: str | None
+    # Whether this agent posts to Slack at all. Off by default, including for
+    # agents that predate the column -- see the 0026 migration on why opt-in.
+    # Gates the lead alert and the transfer-failure alert alike; the worker's
+    # SLACK_WEBHOOK_URL still has to be set for either to go anywhere.
+    slack_notifications_enabled: bool
 
     @staticmethod
     def from_row(row: dict[str, Any]) -> "Agent":
@@ -184,6 +189,10 @@ class Agent:
             knowledge_base_content=row.get("knowledge_base_content") or "",
             knowledge_base_description=row.get("knowledge_base_description") or "",
             end_call_webhook_url=row.get("end_call_webhook_url"),
+            # Absent key reads as off, matching the column default -- a worker
+            # running against a database without 0026 stays quiet rather than
+            # broadcasting on a setting nobody chose.
+            slack_notifications_enabled=bool(row.get("slack_notifications_enabled")),
         )
 
 

@@ -1,7 +1,19 @@
 """Direct Slack notifications -- the Phase 6 replacement for what the FSD
 originally routed through n8n (Sections 5.3.1/5.3.2). Since this build skips
-n8n entirely, the worker posts to the Slack incoming-webhook URL itself right
-after each call ends.
+n8n entirely, the worker posts to the Slack incoming-webhook URL itself once a
+call has ended.
+
+Two messages, not three, and deliberately not one per call:
+
+  send_lead_alert            -- the call captured lead details (analysis.is_lead)
+  send_transfer_failure_alert -- a transfer failed and a callback is owed
+
+The per-call summary that used to fire on every non-test call is gone. See the
+0026 migration for the reasoning; the short version is that a channel carrying
+every robocall and four-second hangup is a channel nobody reads, and it cost
+the alerts that mattered. Whether an agent posts at all is its own toggle
+(`agents.slack_notifications_enabled`, off by default), checked by the caller
+in entrypoint.py rather than in here.
 
 NOTE: the exact message copy/format here is a reasonable best-effort, not a
 transcription of FSD Section 5.3.1/5.3.2 -- I don't have that section's exact
@@ -36,7 +48,7 @@ async def _post_to_slack(payload: dict) -> None:
         logger.exception("failed to post Slack notification")
 
 
-async def send_call_summary(
+async def send_lead_alert(
     *,
     agent: Agent,
     caller_number: str | None,
@@ -47,23 +59,51 @@ async def send_call_summary(
     lead_company: str | None,
     lead_need: str | None,
 ) -> None:
-    """FSD 5.3.1 equivalent: the standard per-call summary."""
+    """Posted when a call captured lead details -- see analysis.is_lead for what
+    counts, and the 0026 migration for why this replaced the summary that used
+    to fire on every single call.
+
+    Whether it fires at all is the caller's decision to make, not this
+    function's: entrypoint checks the agent's toggle and `is_lead` before
+    getting here. This only formats.
+
+    Sent as an attachment with fields rather than the plain markdown lines the
+    transfer alert uses, because this one has structured content -- a name, a
+    company, a need -- and fields put those in a scannable grid instead of a
+    paragraph someone has to read to find the phone number.
+    """
 
     minutes, seconds = divmod(duration_seconds, 60)
-    lines = [
-        f"*Call finished* -- {agent.name}",
-        f"*From:* {caller_number or 'unknown'}",
-        f"*Outcome:* {(outcome or 'unknown').replace('_', ' ')}",
-        f"*Duration:* {minutes}m {seconds}s",
+
+    # Slack drops a field whose value is empty, so every one is given a filler.
+    # `short` pairs them two-per-row; the need runs full width because it's the
+    # only free text and wrapping it into a column makes it unreadable.
+    fields: list[dict[str, Any]] = [
+        {"title": "Name", "value": lead_name or "not given", "short": True},
+        {"title": "Company", "value": lead_company or "not given", "short": True},
+        {"title": "Phone", "value": caller_number or "unknown", "short": True},
+        {"title": "Duration", "value": f"{minutes}m {seconds}s", "short": True},
     ]
     if matched_department:
-        lines.append(f"*Transferred to:* {matched_department}")
-    if lead_name or lead_company:
-        lines.append(f"*Lead:* {lead_name or '—'} ({lead_company or 'no company given'})")
+        fields.append({"title": "Transferred to", "value": matched_department, "short": True})
     if lead_need:
-        lines.append(f"*Need:* {lead_need}")
+        fields.append({"title": "What they need", "value": lead_need, "short": False})
 
-    await _post_to_slack({"text": "\n".join(lines)})
+    await _post_to_slack(
+        {
+            "text": f":white_check_mark: New lead -- {agent.name}",
+            "attachments": [
+                {
+                    "color": "good",
+                    "fields": fields,
+                    # The outcome is a footnote rather than a field: it's the
+                    # model's own label, and the captured details above are the
+                    # firmer fact. Worth showing, not worth leading with.
+                    "footer": f"Outcome: {(outcome or 'not set').replace('_', ' ')}",
+                }
+            ],
+        }
+    )
 
 
 async def send_end_call_webhook(
