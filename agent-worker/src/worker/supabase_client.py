@@ -168,10 +168,15 @@ async def insert_call_log(
     # shows which is which.
     caller_name: str | None = None,
     analysis_model: str | None = None,
-) -> None:
+) -> str | None:
     """Writes the post-call record directly to Supabase. There is no n8n hop
     in this build -- see settings.SlackSettings -- so this and
-    notify.py::send_lead_alert are the entire Phase 6 replacement."""
+    notify.py::send_lead_alert are the entire Phase 6 replacement.
+
+    Returns the new row's call_log_id, so the Slack lead alert can link to the
+    call record instead of restating it -- and None when the write failed, which
+    is why the caller must treat the link as optional rather than assuming an id
+    always comes back."""
 
     # Rounded to the microdollar the column stores. A three-minute call costs
     # around $0.07, so the interesting digits are the fourth and fifth -- these
@@ -191,7 +196,7 @@ async def insert_call_log(
 
     client = await get_client()
     try:
-        await client.table("call_logs").insert(
+        result = await client.table("call_logs").insert(
             {
                 "call_sid": call_sid,
                 "room_id": room_id,
@@ -230,3 +235,12 @@ async def insert_call_log(
         # A failed write shouldn't crash call teardown -- the call already
         # happened. Logged loudly so it's caught in worker monitoring instead.
         logger.exception("failed to write call_logs row for call_sid=%s", call_sid)
+        return None
+
+    # Defensive rather than indexing straight in: this id is only used to build
+    # a convenience link, and a client that returns the row in an unexpected
+    # shape must not be the thing that takes down call teardown.
+    rows = getattr(result, "data", None) or []
+    if rows and isinstance(rows[0], dict):
+        return rows[0].get("call_log_id")
+    return None

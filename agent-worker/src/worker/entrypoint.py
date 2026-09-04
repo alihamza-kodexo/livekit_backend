@@ -1041,7 +1041,7 @@ async def _log_and_notify(
         cost.telephony_usd,
     )
 
-    await insert_call_log(
+    call_log_id = await insert_call_log(
         recording_url=recording_url,
         call_sid=state.call_sid,
         room_id=state.room_name,
@@ -1137,12 +1137,21 @@ async def _log_and_notify(
         await notify.send_lead_alert(
             agent=agent,
             caller_number=state.caller_number,
+            called_number=state.called_number,
             outcome=state.outcome,
             duration_seconds=duration_seconds,
             matched_department=state.matched_department,
             lead_name=state.lead_name,
             lead_company=state.lead_company,
             lead_need=state.lead_need,
+            qualification_answers=state.qualification_answers,
+            # Reuses the analysis computed at the top of this function -- the
+            # summary, the caller's own questions and the priority are already
+            # paid for, and an alert without them only says that a lead
+            # happened rather than what it was.
+            analysis=call_analysis,
+            call_log_id=call_log_id,
+            ended_by=state.ended_by,
         )
     else:
         # Every other call -- spam, wrong numbers, calls that dropped before

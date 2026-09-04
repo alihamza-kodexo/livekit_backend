@@ -24,14 +24,39 @@ real FSD text before launch, not as already-verified copy.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
 from .models import Agent, CallOutcome
 from .settings import slack_settings
 
+if TYPE_CHECKING:
+    # Under TYPE_CHECKING only: annotations are strings here (see the __future__
+    # import), so the dataclass is never needed at runtime -- and importing
+    # analysis for real would drag the whole utility-LLM stack in with it.
+    from .analysis import CallAnalysis
+
 logger = logging.getLogger("worker.notify")
+
+# Slack's own per-element ceilings. A block that exceeds one of these makes the
+# *whole* message fail with invalid_blocks rather than arriving trimmed, so
+# every free-text field below is cut to fit before it is sent.
+_SECTION_LIMIT = 2900  # Slack's limit is 3000; leave room for the bold label
+_HEADER_LIMIT = 150
+
+
+def _truncate(value: str | None, limit: int) -> str:
+    text = (value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+# Matches the emoji vocabulary the team's existing n8n lead alert already uses,
+# so the two sources of leads read the same way in the channel.
+_PRIORITY_EMOJI = {"High": "🔥", "Medium": "⚡", "Low": "🧊"}
+_PRIORITY_COLOR = {"High": "#d72b3f", "Medium": "warning", "Low": "good"}
 
 
 async def _post_to_slack(payload: dict) -> None:
@@ -52,12 +77,25 @@ async def send_lead_alert(
     *,
     agent: Agent,
     caller_number: str | None,
+    called_number: str | None,
     outcome: CallOutcome | None,
     duration_seconds: int,
     matched_department: str | None,
     lead_name: str | None,
     lead_company: str | None,
     lead_need: str | None,
+    qualification_answers: dict[str, Any] | None = None,
+    # The post-call analysis, already computed by the time entrypoint reaches
+    # this (see _log_and_notify's ordering) -- so the summary, the caller's own
+    # questions and the priority cost nothing extra to include. Leaving them out
+    # was the difference between an alert someone can act on and one that only
+    # says a lead happened.
+    analysis: CallAnalysis | None = None,
+    # Links the message to the full record -- transcript, recording, cost. None
+    # when the insert failed or DASHBOARD_BASE_URL isn't configured, in which
+    # case the button is simply omitted.
+    call_log_id: str | None = None,
+    ended_by: str | None = None,
 ) -> None:
     """Posted when a call captured lead details -- see analysis.is_lead for what
     counts, and the 0026 migration for why this replaced the summary that used
@@ -67,40 +105,161 @@ async def send_lead_alert(
     function's: entrypoint checks the agent's toggle and `is_lead` before
     getting here. This only formats.
 
-    Sent as an attachment with fields rather than the plain markdown lines the
-    transfer alert uses, because this one has structured content -- a name, a
-    company, a need -- and fields put those in a scannable grid instead of a
-    paragraph someone has to read to find the phone number.
+    Block Kit inside a coloured attachment, rather than either alone. Blocks
+    because the interesting content is now long-form prose -- the call summary
+    and the caller's own questions -- which an attachment `field` renders in a
+    cramped half-width column and truncates badly. The attachment wrapper is
+    kept purely for the coloured bar down the left, which Block Kit has no way
+    to produce on its own and which is how priority reads at a glance in a busy
+    channel.
     """
 
     minutes, seconds = divmod(duration_seconds, 60)
+    priority = (analysis.priority if analysis else None) or None
+    emoji = _PRIORITY_EMOJI.get(priority or "", "✅")
 
-    # Slack drops a field whose value is empty, so every one is given a filler.
-    # `short` pairs them two-per-row; the need runs full width because it's the
-    # only free text and wrapping it into a column makes it unreadable.
-    fields: list[dict[str, Any]] = [
-        {"title": "Name", "value": lead_name or "not given", "short": True},
-        {"title": "Company", "value": lead_company or "not given", "short": True},
-        {"title": "Phone", "value": caller_number or "unknown", "short": True},
-        {"title": "Duration", "value": f"{minutes}m {seconds}s", "short": True},
+    # The agent's name is in the header, and repeated in `text` -- the latter is
+    # what Slack shows in notifications and sidebar previews, where blocks are
+    # not rendered at all. Without it a push notification would say nothing
+    # about which agent, or which lead, it was for.
+    who = lead_name or (analysis.caller_name if analysis else None) or "Unknown caller"
+    fallback = f"{emoji} New lead for {agent.name}: {who}"
+
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": _truncate(f"{emoji} New lead — {agent.name}", _HEADER_LIMIT),
+                "emoji": True,
+            },
+        }
     ]
+
+    # Who called. `caller_name` is the analysis model's guess and is only used
+    # when the record_lead_info tool captured nothing -- and it is labelled as a
+    # guess, because a name someone typed into a CRM off the back of this should
+    # not silently be a transcription artefact.
+    if lead_name:
+        headline = f"*{lead_name}*"
+    elif analysis and analysis.caller_name:
+        headline = f"*{analysis.caller_name}* (name inferred from the transcript, not confirmed)"
+    else:
+        headline = "*Name not captured*"
+    if lead_company:
+        headline += f" — {lead_company}"
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": headline}})
+
+    facts = [
+        f"*Phone*\n{caller_number or 'unknown'}",
+        f"*Duration*\n{minutes}m {seconds}s",
+        f"*Priority*\n{priority or 'not judged'}",
+        f"*Outcome*\n{(outcome or 'not set').replace('_', ' ')}",
+    ]
+    if called_number:
+        facts.append(f"*They dialled*\n{called_number}")
     if matched_department:
-        fields.append({"title": "Transferred to", "value": matched_department, "short": True})
+        facts.append(f"*Transferred to*\n{matched_department}")
+    blocks.append(
+        {
+            "type": "section",
+            # Slack renders at most 10 fields per section, two per row.
+            "fields": [{"type": "mrkdwn", "text": f} for f in facts[:10]],
+        }
+    )
+
     if lead_need:
-        fields.append({"title": "What they need", "value": lead_need, "short": False})
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*What they need*\n{_truncate(lead_need, _SECTION_LIMIT)}",
+                },
+            }
+        )
+
+    if analysis and analysis.call_summary:
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Call summary*\n{_truncate(analysis.call_summary, _SECTION_LIMIT)}",
+                },
+            }
+        )
+
+    if analysis and analysis.user_queries:
+        # The caller's own words, which is the detail a salesperson actually
+        # wants before ringing back -- the summary paraphrases, this doesn't.
+        asked = "\n".join(f"• {q}" for q in analysis.user_queries)
+        blocks.append(
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*What they asked*\n{_truncate(asked, _SECTION_LIMIT)}",
+                },
+            }
+        )
+
+    if qualification_answers:
+        # Whatever the agent's own qualification_criteria captured. Keys are
+        # admin-defined per agent, so they're printed as configured rather than
+        # mapped to anything this function pretends to know about.
+        answers = "\n".join(
+            f"• *{key.replace('_', ' ')}:* {value}"
+            for key, value in qualification_answers.items()
+            if value not in (None, "")
+        )
+        if answers:
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": f"*Qualification*\n{_truncate(answers, _SECTION_LIMIT)}",
+                    },
+                }
+            )
+
+    settings = slack_settings()
+    if call_log_id and settings.dashboard_base_url:
+        # The escape hatch for everything deliberately not in this message: the
+        # full transcript, the recording, the cost breakdown. Cheaper than
+        # trying to fit any of it into Slack.
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "Open call record", "emoji": True},
+                        "url": f"{settings.dashboard_base_url.rstrip('/')}/calls/{call_log_id}",
+                    }
+                ],
+            }
+        )
+
+    footnotes = [f"Ended by: {ended_by or 'not recorded'}"]
+    if analysis and analysis.model:
+        # Attribute the inferred fields, the same way the dashboard does. The
+        # summary and priority above are a model's reading of the call, and
+        # anyone acting on them should be able to see that.
+        footnotes.append(f"Summary/priority by {analysis.model}")
+    blocks.append(
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": " · ".join(footnotes)}],
+        }
+    )
 
     await _post_to_slack(
         {
-            "text": f":white_check_mark: New lead -- {agent.name}",
+            "text": _truncate(fallback, _HEADER_LIMIT),
             "attachments": [
-                {
-                    "color": "good",
-                    "fields": fields,
-                    # The outcome is a footnote rather than a field: it's the
-                    # model's own label, and the captured details above are the
-                    # firmer fact. Worth showing, not worth leading with.
-                    "footer": f"Outcome: {(outcome or 'not set').replace('_', ' ')}",
-                }
+                {"color": _PRIORITY_COLOR.get(priority or "", "good"), "blocks": blocks}
             ],
         }
     )

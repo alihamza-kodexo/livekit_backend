@@ -158,6 +158,13 @@ class SlackSettings:
     posts straight to Slack and straight to Supabase after each call."""
 
     webhook_url: str | None
+    # Where the dashboard is served, e.g. https://voiceagents.kodexolabs.co.
+    # Lives here rather than in its own settings class because building a link
+    # into a Slack message is the only thing the worker uses it for -- it has no
+    # other reason to know the dashboard exists. Optional: with it unset the
+    # lead alert simply omits its "Open call record" button, which is the one
+    # part of that message that can't be assembled from the call alone.
+    dashboard_base_url: str | None
 
 
 @lru_cache
@@ -262,4 +269,7 @@ def recording_settings() -> RecordingSettings:
 
 @lru_cache
 def slack_settings() -> SlackSettings:
-    return SlackSettings(webhook_url=os.environ.get("SLACK_WEBHOOK_URL") or None)
+    return SlackSettings(
+        webhook_url=os.environ.get("SLACK_WEBHOOK_URL") or None,
+        dashboard_base_url=os.environ.get("DASHBOARD_BASE_URL") or None,
+    )
