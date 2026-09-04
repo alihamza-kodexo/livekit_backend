@@ -8,8 +8,17 @@ worker and the dashboard depend on.
 The admin dashboard (Next.js) lives in a separate repo: [livekit_frontend](https://github.com/aiautomationkodexo/livekit_frontend).
 
 - `agent-worker/` -- Python LiveKit agent worker (STT -> LLM -> TTS call flow)
-- `infra/` -- self-hosted LiveKit + SIP bridge (docker-compose), backup scripts
+- `infra/` -- self-hosted LiveKit + SIP bridge (docker-compose), deploy and backup scripts
 - `supabase/` -- database schema migrations
+
+## Setting this up
+
+**[DEPLOYMENT.md](DEPLOYMENT.md) is the step-by-step VPS guide** -- clone to
+first answered call, in the order things have to happen, with a way to check
+each step and a troubleshooting table for the failures that are silent.
+
+`infra/README.md` goes deeper on LiveKit and SIP. The section below covers the
+database on its own.
 
 ## Database setup
 

@@ -1,10 +1,19 @@
 # LiveKit + SIP — self-hosted infra
 
+> Setting up a whole deployment? Follow **[../DEPLOYMENT.md](../DEPLOYMENT.md)**
+> instead — it puts these steps in the right order relative to the database,
+> the worker and the dashboard. This file is the detail on the LiveKit and SIP
+> layer specifically.
+
 This runs the two self-hosted pieces the FSD calls for: the LiveKit media
 server and the LiveKit SIP bridge (the thing Twilio actually talks to). It's
 the same `docker-compose.yml` whether you run it on this machine via Docker
 Desktop to validate the setup, or on the production VPS — only the host
 changes.
+
+`deploy/deploy-backend.sh` is the VPS deploy script: it pulls `main`, migrates
+the database, and restarts whatever changed. See DEPLOYMENT.md for how to
+install it, and the comments in the file for why it refuses to run as root.
 
 Redis is included because LiveKit recommends it for production and the SIP
 bridge requires it for state.
