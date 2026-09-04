@@ -70,7 +70,17 @@ fi
 if echo "$CHANGED" | grep -q '^infra/'; then
   # Recreates the LiveKit/SIP containers, which drops anyone mid-call.
   echo "infra changed; recreating containers (this interrupts active calls)..."
-  sudo -n docker compose -f "$REPO/infra/docker-compose.yml" up -d
+
+  # `cd` into infra rather than pointing -f at it from wherever the previous
+  # branch left the working directory. docker-compose.yml interpolates
+  # ${LIVEKIT_API_KEY}, ${LIVEKIT_API_SECRET} and ${REDIS_PASSWORD} from
+  # infra/.env, and Compose resolves that file relative to the project
+  # directory. Run it from the wrong directory and those expand to empty
+  # strings: Redis comes up with `--requirepass ""`, LiveKit's `keys:` map
+  # becomes `: ` and the server refuses every token. Nothing warns; the
+  # containers just start and no call can authenticate.
+  cd "$REPO/infra"
+  sudo -n docker compose up -d
 fi
 
 echo "Backend deployed: $(git rev-parse --short HEAD)"
