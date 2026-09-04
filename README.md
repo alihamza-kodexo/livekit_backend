@@ -10,3 +10,59 @@ The admin dashboard (Next.js) lives in a separate repo: [livekit_frontend](https
 - `agent-worker/` -- Python LiveKit agent worker (STT -> LLM -> TTS call flow)
 - `infra/` -- self-hosted LiveKit + SIP bridge (docker-compose), backup scripts
 - `supabase/` -- database schema migrations
+
+## Database setup
+
+One command, whether the database is empty or already half-built:
+
+```bash
+cd agent-worker
+python -m worker.migrate
+```
+
+It needs `SUPABASE_DB_URL` -- the Postgres connection string from Supabase ->
+Project Settings -> Database -> Connection string -> URI. Not the REST URL and
+service-role key the worker uses for everything else: those go through
+PostgREST, which cannot create tables.
+
+`python -m worker.migrate --dry-run` reports what would run and changes nothing.
+
+### Standing up a new environment
+
+Set `SUPABASE_DB_URL` and `ADMIN_EMAIL` on a fresh Supabase project, then run
+the command above. All 26 migrations apply in order in one pass -- there is no
+file-by-file pasting into the SQL editor.
+
+`ADMIN_EMAIL` matters: migrations 0003/0004 seed Kodexo's own addresses into
+`allowed_users`, so without it nobody at the new deployment can sign in to the
+dashboard. Those two seeded addresses also arrive with the migrations -- for a
+deployment that isn't ours, remove them afterwards:
+
+```sql
+delete from allowed_users where email like '%@kodexolabs.com' or email = 'ai-automation@gmail.com';
+```
+
+The schema is all this sets up. Still manual, because no migration can do
+them: Supabase Auth users, the LiveKit SIP trunk and dispatch rule (see
+`infra/`), the free-tier keepalive cron (`infra/backup/keepalive-ping.sh`), and
+provider API keys -- though those can be entered from the dashboard's
+Integrations page once it is running, rather than put in `.env.local`.
+
+### An existing database
+
+A database built by hand before this runner existed has the schema but no
+`schema_migrations` table. The runner detects that and refuses rather than
+applying `0001` on top of live data. Adopt it into tracking instead -- this
+writes only the bookkeeping table and runs no DDL:
+
+```bash
+python -m worker.migrate --adopt
+```
+
+### Deploying a schema change
+
+Run the migration **before** restarting the worker. New worker code against an
+old schema fails inside `insert_call_log`, which logs and swallows the error --
+so whole call records are lost with nothing but a line in the worker log to
+show for it. Adding `python -m worker.migrate` to the deploy script ahead of
+the `systemctl restart` removes that risk entirely.

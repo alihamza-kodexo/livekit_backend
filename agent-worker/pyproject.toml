@@ -15,6 +15,10 @@ dependencies = [
     "google-genai",
     "livekit-plugins-noise-cancellation",
     "supabase>=2.9",
+    # A real Postgres connection, for `python -m worker.migrate` only. The
+    # supabase client above goes through PostgREST, which cannot run DDL, so
+    # the schema cannot be created with it. Nothing on the call path uses this.
+    "psycopg[binary]>=3.1",
     "httpx>=0.27",
     "python-dotenv>=1.0",
     # Call recordings: Egress writes the file, this uploads it. Imported lazily
