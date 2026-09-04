@@ -13,9 +13,21 @@ The admin dashboard (Next.js) lives in a separate repo: [livekit_frontend](https
 
 ## Setting this up
 
-**[DEPLOYMENT.md](DEPLOYMENT.md) is the step-by-step VPS guide** -- clone to
-first answered call, in the order things have to happen, with a way to check
-each step and a troubleshooting table for the failures that are silent.
+On a fresh VPS:
+
+```bash
+sudo mkdir -p /opt/kodexo && sudo chown -R "$USER:$USER" /opt/kodexo
+git clone https://github.com/alihamza-kodexo/livekit_backend.git /opt/kodexo/backend
+/opt/kodexo/backend/infra/deploy/bootstrap.sh
+```
+
+It does everything mechanical and stops with an exact instruction whenever it
+needs a credential only you can fetch. Re-run it after filling those in -- it
+resumes, and never overwrites config that already exists.
+
+**[DEPLOYMENT.md](DEPLOYMENT.md)** is the long way round: every step by hand, a
+way to verify each one, and a troubleshooting table for the failures that are
+silent. Use it when the script fails, or to see what it is doing.
 
 `infra/README.md` goes deeper on LiveKit and SIP. The section below covers the
 database on its own.

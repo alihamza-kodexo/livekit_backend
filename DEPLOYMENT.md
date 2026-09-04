@@ -1,5 +1,32 @@
 # Deploying the voice agent on a VPS
 
+## The short way
+
+```bash
+sudo mkdir -p /opt/kodexo && sudo chown -R "$USER:$USER" /opt/kodexo
+git clone https://github.com/alihamza-kodexo/livekit_backend.git /opt/kodexo/backend
+/opt/kodexo/backend/infra/deploy/bootstrap.sh
+```
+
+`bootstrap.sh` does everything mechanical — venv, LiveKit and Redis secrets,
+containers, schema, systemd, the deploy symlink — and **stops with an exact
+instruction** the moment it needs a credential only you can fetch. Fill that
+in, run it again; it picks up where it left off and is safe to re-run at any
+point. It never overwrites a secret or config that already exists.
+
+It finishes by verifying what it built (containers up, service active, schema
+current) and printing the handful of things no script can do: firewall rules,
+the Twilio Origination URI, the SIP dispatch rule, the Supabase Auth user, the
+dashboard, and the per-agent settings.
+
+**The rest of this document is the long way round.** Follow it when the script
+fails, or when you want to know what it is actually doing — a script that hides
+thirty commands is excellent right up until it half-works.
+
+---
+
+# The long way
+
 Start to finish, in the order things actually have to happen. Every step says
 how to tell it worked, because most of the failures here are silent — a call
 that rings out, a Slack message that never arrives, a database write that is
