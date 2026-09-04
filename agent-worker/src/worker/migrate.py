@@ -135,13 +135,41 @@ def _ensure_tracking_table(cur: psycopg.Cursor) -> None:
 
 
 def _sha256(path: pathlib.Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """Checksum of the migration's *content*, with line endings normalised.
+
+    Hashing raw bytes was wrong across platforms. 0019 was committed with CRLF
+    while the other 25 files are LF, and with core.autocrlf in play the same
+    commit yields different bytes on a Windows machine and on the Linux VPS.
+    Both run identical SQL, but a raw-bytes checksum called that drift and
+    warned on every single deploy -- which is worse than not checking at all,
+    because a warning that always fires is a warning nobody reads when a real
+    change appears.
+
+    Normalising CRLF to LF compares what actually matters. A genuine edit still
+    changes the hash; a checkout on a different OS no longer does.
+    """
+    text = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(text).hexdigest()
 
 
 def _record(cur: psycopg.Cursor, path: pathlib.Path, *, adopted: bool) -> None:
+    """Record a migration as applied.
+
+    --adopt overwrites an existing checksum; a normal apply does not. Adopting
+    means "this database matches these files as they stand now", so it doubles
+    as the way to re-baseline after the checksum rule itself changes -- which is
+    exactly what the CRLF fix above needed. A normal run must never quietly
+    rewrite a checksum, because that is the one record showing a migration was
+    edited after it ran.
+    """
+    conflict = (
+        "do update set sha256 = excluded.sha256, adopted = true, applied_at = now()"
+        if adopted
+        else "do nothing"
+    )
     cur.execute(
         "insert into schema_migrations (filename, sha256, adopted) values (%s, %s, %s) "
-        "on conflict (filename) do nothing",
+        f"on conflict (filename) {conflict}",
         (path.name, _sha256(path), adopted),
     )
 
